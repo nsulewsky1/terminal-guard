@@ -1,13 +1,13 @@
 # Testing
 
-Two layers:
+There are two sets of tests. The fast set covers unit, tamper, property and
+doc tests. It uses a mock clock in a single process with no sockets, so it's
+deterministic and worth running on every change.
 
-1. **Fast deterministic tests.** Unit, tamper, property and doc tests. Mock
-   clock, single process, no sockets. Run on every change.
-2. **Real-time integration tests.** Separate OS processes, a real loopback
-   TCP approval channel, the real monotonic clock and a seconds-scale test
-   policy. Marked `#[ignore]` so the fast suite stays fast; run them with
-   `--ignored`.
+The integration set runs separate OS processes over a real loopback TCP
+channel, using the real monotonic clock and a test policy measured in
+seconds. Those tests are marked `#[ignore]` to keep the fast set fast, so
+you run them with `--ignored`.
 
 ## Commands
 
@@ -21,74 +21,77 @@ Two layers:
 | Lint | `cargo clippy --all-targets --locked -- -D warnings` | a few s |
 | Demo | `cargo run --example demo` | <1 s |
 
-\*Measured after a build, on the development machine (Linux x86_64,
+\*Measured after a build on the development machine (Linux x86_64,
 rustc 1.99.1). First builds take longer. The full suite also passes on
 rustc 1.85.1, the minimum supported version.
 
 ## What the integration suite does
 
-The test process acts as harness and supervisor. It re-runs its own test
-binary as a mock agent process (`agent_process_entry`, inactive unless the
-harness sets `TG_IT_AGENT=1`; in a normal run it reports `ok` and does
-nothing).
+The test process is both the harness and the supervisor. It starts its own
+test binary again as a mock agent process (`agent_process_entry`). That
+entry point does nothing unless the harness sets `TG_IT_AGENT=1`, so in a
+normal run it just reports `ok`.
 
-The mock agent:
+The mock agent owns a `Guard` running on `SystemClock`. It listens on
+`127.0.0.1`, on a random free port, for signed renewals sent as one JSON
+line each, and replies `OK level=...` or `ERR <code>`. It takes `STATUS`,
+`DO <action>` and `QUIT` on stdin. It checks the decision before running a
+harmless local action (read a fixture file, append a draft note, delete a
+scratch file), and it never runs a `needs_approval` action.
+`send_external_message` would only append to a local outbox file, and the
+tests confirm that file never gets written.
 
-- owns a `Guard` with `SystemClock`;
-- listens on `127.0.0.1` on a random free port for signed renewals, one JSON
-  line each, and replies `OK level=...` or `ERR <code>`;
-- takes `STATUS`, `DO <action>` and `QUIT` on stdin;
-- checks the decision **before** running a harmless local action (read a
-  fixture file, append a draft note, delete a scratch file). `needs_approval`
-  is never executed. "send_external_message" would only append to a local
-  outbox file, and the tests confirm that file is never written.
+The test policy steps down to degraded at 3 s, lost at 6 s and hold at 9 s,
+and renewals are valid for 3 s.
 
-Tests (test policy: degraded at 3 s, lost at 6 s, hold at 9 s, renewals valid
-for 3 s):
+`lifecycle_disconnect_decay_reconnect_restore` (about 11 s) starts the
+agent in hold and sends a fresh signed renewal, which brings it to
+`connected`. Then it shuts the supervisor socket down and watches the level
+step to degraded, lost and hold on schedule, checking that no permission
+widens along the way. Reconnecting the socket on its own changes nothing.
+The agent rejects eight bad renewals: replayed, stale, future-dated, signed
+with the wrong key, signed with the audit key, addressed to the wrong
+engine, edited after signing, and not JSON at all. A new fresh renewal
+restores `connected`, and `needs_approval` actions still don't run. At the
+end the log passes `terminal-guard verify` and records each step-down.
 
-- `lifecycle_disconnect_decay_reconnect_restore` (~11 s): starts in hold; a
-  fresh signed renewal gives `connected`; the supervisor socket is shut down;
-  the level steps to degraded, lost, hold on schedule with no permission ever
-  widening; reconnecting the socket alone changes nothing; replayed, stale,
-  future-dated, wrong-key, audit-key-signed, wrong-engine, edited and
-  non-JSON renewals are rejected; a new fresh renewal restores `connected`
-  while `needs_approval` actions still do not run; the log verifies with the
-  `terminal-guard verify` CLI and records each step-down.
-- `restart_recovers_replay_floor_from_verified_log` (~1 s): the agent is
-  killed and restarted; it verifies its log, restores the replay floor,
-  starts in hold and rejects the already-used but still-fresh renewal. A
-  control run without the old log accepts that same message, which shows
-  the documented caveat: the replay floor is only as good as the log you
-  keep.
-- `log_tampering_vs_retained_checkpoint` (~1 s): deleting, editing or
-  truncating the newest entry fails against a retained copy of the latest
-  checkpoint; a wrong pinned key fails; the agent refuses to restart on a
-  tampered log. It also shows the **known limit**: rolling back the log and
-  checkpoint together to an earlier pair passes a file-only check, and is
-  caught only by the separately retained latest checkpoint.
+`restart_recovers_replay_floor_from_verified_log` (about 1 s) kills the
+agent and starts it again. On restart it verifies its log, restores the
+replay floor, starts in hold, and rejects a renewal that's already been used
+even though it's still fresh. A control run without the old log accepts
+that same message. That's the documented caveat: the replay floor is only
+as good as the log you keep.
 
-Artifacts (logs, checkpoints, public keys, fixture files) are kept under
-`target/tmp/tg-integration/<test>-<pid>-<time>/` for inspection. `target/` is
-git-ignored. Delete with `rm -rf target/tmp/tg-integration`.
+`log_tampering_vs_retained_checkpoint` (about 1 s) deletes, edits and
+truncates the newest log entry, and each version fails against a retained
+copy of the latest checkpoint. A wrong pinned key fails too, and the agent
+refuses to restart on a tampered log. The test also shows the known limit:
+if the log and checkpoint are rolled back together to an earlier pair, a
+check of those two files passes. Only the separately kept latest checkpoint
+catches it.
 
-Keys are generated per run. The audit signing key is passed to the agent
-process in an environment variable and is never written to disk; on a
-shared machine, other processes of the same user could read it while the
-test runs.
+Logs, checkpoints, public keys and fixture files stay under
+`target/tmp/tg-integration/<test>-<pid>-<time>/` so you can look at them.
+`target/` is git-ignored. Clear them with `rm -rf target/tmp/tg-integration`.
 
-Every wait has a 15 s timeout with a clear error, and agent processes are
+Keys are generated for each run. The audit signing key reaches the agent
+process through an environment variable and is never written to disk. On a
+shared machine, other processes running as the same user could read it
+while a test runs.
+
+Every wait times out after 15 s with a clear error, and agent processes are
 killed when a test ends or fails.
 
-## Boundary: what these tests do and do not show
+## What these tests show, and what they don't
 
-They show the guard's behavior across real processes, a real socket that is
-really closed and reopened, real elapsed time, real file I/O and a real
-process kill and restart, all on one machine.
+They show how the guard behaves across real processes, with a socket that's
+actually closed and reopened, real elapsed time, real file I/O and a real
+process kill and restart. All of it happens on one machine.
 
-They do **not** show behavior during a physical network unplug, a partition
-between separate hosts, radio links, or any real agent or language model.
-The socket being up or down does not affect the guard by design; only time
-and signed renewals do.
+They don't show behavior during a physical network unplug, a partition
+between separate hosts, a radio link, or with a real agent or language
+model. By design, the socket being up or down doesn't affect the guard. Only
+time and signed renewals do.
 
 ## CI
 
