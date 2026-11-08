@@ -8,8 +8,8 @@ shrink on a fixed schedule. Only a fresh message signed by a trusted person
 moves them back up. Every decision goes into a signed, hash-chained audit log
 that anyone holding the audit public key can check.
 
-Status: early first version (0.1.0). Intended to be open source; the license
-has not been chosen yet, so no license is granted until one is added.
+Status: early first version (0.1.0). Open source under the
+[Apache License 2.0](LICENSE).
 
 ## What it does
 
@@ -155,3 +155,8 @@ policies/example.toml       example policy
 (parsing), `proptest` (property tests). No custom cryptography.
 
 Minimum Rust version: 1.85.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) or
+<https://www.apache.org/licenses/LICENSE-2.0>.

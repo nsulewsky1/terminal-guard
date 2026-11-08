@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Fail-closed lost-link policy engine for AI agents: permissions shrink as human contact ages, with a signed hash-chained audit log."
 readme = "README.md"
+license = "Apache-2.0"
 keywords = ["ai-agent", "policy", "audit-log", "lost-link", "fail-closed"]
 categories = ["authentication", "cryptography"]
 publish = false
