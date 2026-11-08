@@ -22,7 +22,7 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -498,6 +498,23 @@ pub fn last_contact_sequence(report: &VerifyReport) -> Option<u64> {
     report.last_contact_sequence
 }
 
+/// Read a whole file as UTF-8, refusing files larger than `max` bytes
+/// before reading them.
+pub fn read_bounded(path: &Path, max: usize) -> Result<String, AuditError> {
+    let f = File::open(path).map_err(io)?;
+    let len = f.metadata().map_err(io)?.len();
+    if len > max as u64 {
+        return Err(AuditError::TooLarge);
+    }
+    let mut s = String::with_capacity(len as usize);
+    // take() guards against a file that grows while we read it.
+    f.take(max as u64 + 1).read_to_string(&mut s).map_err(io)?;
+    if s.len() > max {
+        return Err(AuditError::TooLarge);
+    }
+    Ok(s)
+}
+
 // ---- writer ------------------------------------------------------------
 
 fn io<E: fmt::Display>(e: E) -> AuditError {
@@ -512,6 +529,10 @@ pub struct AuditLog {
     log_id: String,
     count: u64,
     head: [u8; 32],
+    last_contact_sequence: Option<u64>,
+    /// Bytes we expect the log file to hold. A mismatch before an append
+    /// means someone else changed the file, so the append fails closed.
+    expected_len: u64,
 }
 
 impl fmt::Debug for AuditLog {
@@ -551,6 +572,8 @@ impl AuditLog {
             log_id: log_id.to_string(),
             count: 0,
             head: GENESIS_HASH,
+            last_contact_sequence: None,
+            expected_len: 0,
         };
         log.write_checkpoint()?;
         Ok(log)
@@ -564,13 +587,11 @@ impl AuditLog {
         log_id: &str,
         key: SigningKey,
     ) -> Result<(Self, VerifyReport), AuditError> {
-        let log_text = fs::read_to_string(log_path).map_err(io)?;
-        let cp_text = match fs::read_to_string(checkpoint_path) {
+        let log_text = read_bounded(log_path, MAX_LOG_BYTES)?;
+        let cp_text = match read_bounded(checkpoint_path, MAX_LINE_BYTES) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(AuditError::MissingCheckpoint);
-            }
-            Err(e) => return Err(io(e)),
+            Err(_) if !checkpoint_path.exists() => return Err(AuditError::MissingCheckpoint),
+            Err(e) => return Err(e),
         };
         let report = verify_log(
             &log_text,
@@ -586,6 +607,8 @@ impl AuditLog {
             log_id: log_id.to_string(),
             count: report.entries,
             head: report.head,
+            last_contact_sequence: report.last_contact_sequence,
+            expected_len: log_text.len() as u64,
         };
         Ok((log, report))
     }
@@ -598,6 +621,10 @@ impl AuditLog {
     }
     pub fn count(&self) -> u64 {
         self.count
+    }
+    /// Sequence of the last accepted contact recorded in this log, if any.
+    pub fn last_contact_sequence(&self) -> Option<u64> {
+        self.last_contact_sequence
     }
 
     /// Append one entry, fsync it, then rewrite the checkpoint.
@@ -626,10 +653,24 @@ impl AuditLog {
             .append(true)
             .open(&self.log_path)
             .map_err(io)?;
+        // Single writer only. If the file isn't the length we left it at,
+        // another writer or an edit got in, and continuing would fork the
+        // chain. This is a best-effort check, not a lock.
+        let len = f.metadata().map_err(io)?.len();
+        if len != self.expected_len {
+            return Err(AuditError::Io(format!(
+                "log file changed underneath the writer (expected {} bytes, found {len})",
+                self.expected_len
+            )));
+        }
         f.write_all(line.as_bytes()).map_err(io)?;
         f.sync_data().map_err(io)?;
+        self.expected_len += line.len() as u64;
         self.head = Sha256::digest(&bytes).into();
         self.count += 1;
+        if let EntryKind::ContactAccepted { sequence } = entry.kind {
+            self.last_contact_sequence = Some(sequence);
+        }
         self.write_checkpoint()
     }
 

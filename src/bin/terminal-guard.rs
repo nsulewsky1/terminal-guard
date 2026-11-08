@@ -7,10 +7,12 @@
 //!
 //! Exit codes: 0 = OK, 1 = verification/validation failed, 2 = usage error.
 
-use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 
+use terminal_guard::audit::{MAX_LINE_BYTES, MAX_LOG_BYTES, read_bounded};
 use terminal_guard::keys::parse_verifying_key_hex;
+use terminal_guard::policy::MAX_POLICY_BYTES;
 use terminal_guard::{Policy, VerifyMode, verify_log};
 
 const USAGE: &str = "usage:
@@ -34,7 +36,7 @@ fn main() -> ExitCode {
 }
 
 fn check_policy(path: &str) -> ExitCode {
-    let text = match fs::read_to_string(path) {
+    let text = match read_bounded(Path::new(path), MAX_POLICY_BYTES) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("FAIL: cannot read {path}: {e}");
@@ -91,18 +93,18 @@ fn verify(args: &[String]) -> ExitCode {
         eprintln!("FAIL: {msg}");
         ExitCode::from(1)
     };
-    let key_text = match fs::read_to_string(&key) {
+    let key_text = match read_bounded(Path::new(&key), MAX_LINE_BYTES) {
         Ok(t) => t,
         Err(e) => return fail(format!("cannot read audit key {key}: {e}")),
     };
     let Some(vk) = parse_verifying_key_hex(&key_text) else {
         return fail("audit key file is not a valid Ed25519 verifying key".into());
     };
-    let cp_text = match fs::read_to_string(&cp) {
+    let cp_text = match read_bounded(Path::new(&cp), MAX_LINE_BYTES) {
         Ok(t) => t,
         Err(e) => return fail(format!("checkpoint {cp} unreadable: {e}")),
     };
-    let log_text = match fs::read_to_string(&log) {
+    let log_text = match read_bounded(Path::new(&log), MAX_LOG_BYTES) {
         Ok(t) => t,
         Err(e) => return fail(format!("log {log} unreadable: {e}")),
     };

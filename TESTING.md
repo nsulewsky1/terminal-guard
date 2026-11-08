@@ -13,10 +13,10 @@ you run them with `--ignored`.
 
 | What | Command | Typical time* |
 | --- | --- | --- |
-| Fast suite (45 tests; 4 integration tests listed as ignored) | `cargo test --locked` | ~7 s |
+| Fast suite (51 tests; 4 integration tests listed as ignored) | `cargo test --locked` | ~7 s |
 | Integration suite | `cargo test --locked --test integration_loopback -- --ignored` | ~11 s |
 | Integration, with step log | `cargo test --locked --test integration_loopback -- --ignored --nocapture` | ~11 s |
-| Everything (49 tests) | `cargo test --locked -- --include-ignored` | ~17 s |
+| Everything (55 tests) | `cargo test --locked -- --include-ignored` | ~18 s |
 | Format | `cargo fmt --check` | <1 s |
 | Lint | `cargo clippy --all-targets --locked -- -D warnings` | a few s |
 | Demo | `cargo run --example demo` | <1 s |
@@ -24,6 +24,13 @@ you run them with `--ignored`.
 \*Measured after a build on the development machine (Linux x86_64,
 rustc 1.99.1). First builds take longer. The full suite also passes on
 rustc 1.85.1, the minimum supported version.
+
+`tests/regressions.rs` holds tests for defects found in review: a renewal
+accepted at the edge of its freshness window must log the level it really
+produced, a missing wall clock must deny, a reopened log must keep its
+replay floor even if the caller passes a lower one, a log for another engine
+is refused, an outside change to the log stops the guard, and oversized
+files are refused before they're read.
 
 ## What the integration suite does
 

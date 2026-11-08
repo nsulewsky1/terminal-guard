@@ -188,19 +188,27 @@ If the process dies after appending an entry but before rewriting the
 checkpoint, verification fails because there's one extra entry. That fails
 closed, and someone has to look at it.
 
-The last accepted contact sequence lives in memory. After a restart, pass
-`last accepted + 1` to `Guard::new`; the verify report gives you
-`last_contact_sequence`. If you don't, a captured message can be replayed
-until it's older than `max_age_secs`.
+When the guard is built on a log reopened with `AuditLog::open`, it won't
+accept any renewal sequence already recorded in that log, even if you pass
+a lower `next_contact_sequence`. If the log is lost or replaced with a fresh
+one, that floor is gone, and a captured message that's still fresh can be
+accepted once.
 
 Freshness compares the message timestamp to the host clock, so a host with
 the wrong time can accept or reject contact wrongly. Contact age itself uses
-monotonic time.
+monotonic time. If the wall clock can't be read at all, `decide` returns
+`Deny`.
+
+Only one process should write a given log. The guard checks the file length
+before each append and stops (denying everything) if someone else changed
+the file, but that's a best-effort check, not a lock.
 
 If a human key or the audit signing key is stolen, there are no guarantees.
 
 This is an early open-source library with no formal certification, audit or
-deployment history.
+deployment history. [THREAT_MODEL.md](THREAT_MODEL.md) lists the
+assumptions and gaps in one place, and
+[DIFFERENTIATION.md](DIFFERENTIATION.md) compares it with related projects.
 
 ## Layout
 
@@ -216,6 +224,8 @@ examples/demo.rs            simulated lost-link demo
 tests/                      API, unit, tamper and property tests;
                             integration_loopback.rs = multi-process loopback suite
 TESTING.md                  how to run the tests and what they show
+THREAT_MODEL.md             assumptions, defenses and gaps
+DIFFERENTIATION.md          related work and what this adds
 ROADMAP.md                  planned work (not yet built)
 policies/example.toml       example policy
 ```

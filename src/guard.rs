@@ -13,6 +13,8 @@ use crate::policy::{ContactLevel, Decision, Policy};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuardError {
     InvalidEngineId,
+    /// The audit log was created for a different engine ID.
+    LogIdMismatch,
     NoHumanKeys,
     /// The audit key must not also be a trusted human contact key.
     KeyRoleConflict,
@@ -23,6 +25,7 @@ impl fmt::Display for GuardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             GuardError::InvalidEngineId => write!(f, "invalid engine id"),
+            GuardError::LogIdMismatch => write!(f, "audit log id does not match engine id"),
             GuardError::NoHumanKeys => write!(f, "at least one human contact key is required"),
             GuardError::KeyRoleConflict => {
                 write!(f, "audit key must not also be a human contact key")
@@ -62,8 +65,10 @@ impl<C: Clock> Guard<C> {
     /// `Connected` until a fresh verified contact arrives.
     ///
     /// `next_contact_sequence` is the smallest contact sequence that will be
-    /// accepted. After a restart, pass `last accepted + 1` (for example from
-    /// [`crate::audit::VerifyReport::last_contact_sequence`]).
+    /// accepted. If `audit` was reopened with [`AuditLog::open`], the guard
+    /// raises this to one past the last renewal recorded in that log, so a
+    /// lower value cannot re-enable an already-used message. The audit log's
+    /// ID must equal `engine_id`.
     pub fn new(
         policy: Policy,
         engine_id: &str,
@@ -78,6 +83,15 @@ impl<C: Clock> Guard<C> {
         if human_keys.is_empty() {
             return Err(GuardError::NoHumanKeys);
         }
+        if audit.log_id() != engine_id {
+            return Err(GuardError::LogIdMismatch);
+        }
+        // The replay floor can only be raised, never lowered, by the caller:
+        // anything already accepted in a verified, reopened log stays used.
+        let next_contact_sequence = match audit.last_contact_sequence() {
+            Some(last) => next_contact_sequence.max(last.saturating_add(1)),
+            None => next_contact_sequence,
+        };
         let audit_vk = audit.verifying_key();
         if human_keys
             .iter()
@@ -185,7 +199,14 @@ impl<C: Clock> Guard<C> {
             return Err(AuditError::Io("guard poisoned".into()));
         }
         let level = self.current_level()?;
-        let decision = self.policy.decide(action, level);
+        // Without a wall clock the guard cannot judge renewal freshness or
+        // timestamp its log, so it fails closed for this call. The entry is
+        // still logged (with timestamp 0) so the denial is on record.
+        let decision = if self.clock.unix_ms().is_none() {
+            Decision::Deny
+        } else {
+            self.policy.decide(action, level)
+        };
         let logged_action = if valid_ident(action) {
             action.to_string()
         } else {
@@ -220,20 +241,21 @@ impl<C: Clock> Guard<C> {
         };
         match verified {
             Ok(v) => {
+                // Work out the level the renewal actually produces (an old
+                // message is backdated by its age) before writing anything,
+                // and only commit the new state once the entry is durable.
+                let mut next = self.tracker.clone();
+                next.apply(v, &self.clock);
+                let new_level = next.level(&self.policy, &self.clock);
                 let kind = EntryKind::ContactAccepted {
                     sequence: v.sequence(),
                 };
-                if self
-                    .audit
-                    .append(self.now_ms(), ContactLevel::Connected, kind)
-                    .is_err()
-                {
+                if self.audit.append(self.now_ms(), new_level, kind).is_err() {
                     self.poisoned = true;
                     return Err(ContactError::AuditFailed);
                 }
-                self.tracker.apply(v, &self.clock);
-                // Re-read so the stored level matches what was logged.
-                self.logged_level = self.tracker.level(&self.policy, &self.clock);
+                self.tracker = next;
+                self.logged_level = new_level;
                 Ok(())
             }
             Err(e) => {
