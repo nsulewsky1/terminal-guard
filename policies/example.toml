@@ -1,0 +1,45 @@
+# terminal-guard example policy (version 1).
+#
+# Contact levels, best to worst: connected -> degraded -> lost -> hold.
+# Times are seconds since the last verified, signed human contact.
+# The engine always starts at "hold" until a fresh contact arrives.
+version = 1
+
+[levels]
+degraded_after_secs = 600    # 10 minutes
+lost_after_secs     = 3600   # 1 hour
+hold_after_secs     = 14400  # 4 hours
+
+[contact]
+# A signed contact message older than this is rejected as stale.
+max_age_secs = 120
+# Allowed clock skew for messages stamped slightly in the future.
+max_future_skew_secs = 30
+
+# Decisions: "allow", "needs_approval", "deny".
+# Each action must satisfy connected >= degraded >= lost >= hold.
+# Any action not listed here is denied.
+
+[actions.read_local_fixture]
+connected = "allow"
+degraded  = "allow"
+lost      = "allow"
+hold      = "deny"
+
+[actions.draft_local_note]
+connected = "allow"
+degraded  = "allow"
+lost      = "needs_approval"
+hold      = "deny"
+
+[actions.send_external_message]
+connected = "needs_approval"
+degraded  = "needs_approval"
+lost      = "deny"
+hold      = "deny"
+
+[actions.delete_local_file]
+connected = "needs_approval"
+degraded  = "deny"
+lost      = "deny"
+hold      = "deny"
