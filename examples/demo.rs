@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let first = ContactAuth::new(ENGINE_ID, 1, now()).sign(&human_key);
     println!(
         "  -> fresh signed human contact (seq 1): {:?}",
-        guard.accept_contact(&first)
+        guard.apply_signed_approval(&first)
     );
     step(&mut guard, "t+0      after verified contact");
 
@@ -83,12 +83,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "  -> replay of old contact (seq 1): {:?}",
-        guard.accept_contact(&first)
+        guard.apply_signed_approval(&first)
     );
     let forged = ContactAuth::new(ENGINE_ID, 2, now()).sign(&generate());
     println!(
         "  -> contact signed by unknown key: {:?}",
-        guard.accept_contact(&forged)
+        guard.apply_signed_approval(&forged)
     );
 
     clock.advance(Duration::from_secs(3 * 60 * 60));
@@ -98,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fresh = ContactAuth::new(ENGINE_ID, 2, now()).sign(&human_key);
     println!(
         "  -> fresh signed human contact (seq 2): {:?}",
-        guard.accept_contact(&fresh)
+        guard.apply_signed_approval(&fresh)
     );
     step(&mut guard, "t+4h15m  after verified contact");
 
@@ -131,10 +131,10 @@ fn clock_ms(c: &MockClock) -> u64 {
 }
 
 fn step(guard: &mut Guard<MockClock>, label: &str) {
-    let level = guard.level();
+    let level = guard.tick();
     let cells: Vec<String> = ACTIONS
         .iter()
-        .map(|a| format!("{a}={}", short(guard.check(a))))
+        .map(|a| format!("{a}={}", short(guard.decide(a))))
         .collect();
     println!(
         "{label:<38} level={:<9} {}",

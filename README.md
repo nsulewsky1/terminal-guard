@@ -1,7 +1,8 @@
 # terminal-guard
 
 A small, fail-closed policy engine for AI agents that can lose contact with
-the people supervising them.
+the people supervising them. It is a plain Rust library you call in-process:
+no daemon, no network calls.
 
 As time since the last verified human contact grows, the agent's permissions
 shrink on a fixed schedule. Only a fresh message signed by a trusted person
@@ -13,7 +14,7 @@ Status: early first version (0.1.0). Open source under the
 
 ## What it does
 
-1. **Check.** `guard.check("action")` returns `Allow`, `NeedsApproval` or
+1. **Decide.** `guard.decide("action")` returns `Allow`, `NeedsApproval` or
    `Deny`. Unknown actions, malformed names, internal errors and failed audit
    writes all return `Deny`.
 2. **Policy file.** Four contact levels, best to worst:
@@ -24,9 +25,13 @@ Status: early first version (0.1.0). Open source under the
    an action at every level, including `hold`; that is the author's choice.)
 3. **Contact timer.** Uses monotonic time, so wall-clock changes cannot make
    the agent look more connected. Steps down on the schedule and never steps
-   up on its own, even if the clock goes backwards. The engine **starts in
+   up on its own, even if the clock goes backwards. `guard.tick()`
+   re-evaluates the level and logs any step-down (every `decide` does this
+   too). The engine **starts in
    `hold`** on every start and restart until it gets fresh verified contact.
-4. **Signed human contact.** The only way up. A contact message must be
+4. **Signed human contact.** The only way up, via
+   `guard.apply_signed_approval(&msg)`. Reconnecting a network alone does
+   nothing. A contact message must be
    signed (Ed25519, strict verification) by a pinned human key, carry the
    `terminal-guard/contact/v1` domain and this engine's ID, have a sequence
    number higher than any accepted before, and have a timestamp inside the
@@ -82,33 +87,74 @@ t+4h15m  no contact for over 4 h       level=hold      read_local_fixture=deny  
 
 ## Using it
 
-```rust
-use terminal_guard::{AuditLog, Decision, Guard, Policy, SystemClock};
+The crate is not on crates.io. Until it is, add it as a git dependency:
 
-let policy = Policy::from_toml(&std::fs::read_to_string("policies/example.toml")?)?;
-let audit = AuditLog::create("agent.log".as_ref(), "agent.checkpoint".as_ref(), "agent-01", audit_signing_key)?;
-let mut guard = Guard::new(policy, "agent-01", vec![operator_public_key], next_sequence, audit, SystemClock::new())?;
+```toml
+terminal-guard = { git = "https://github.com/nsulewsky1/terminal-guard" }
+```
 
-// Feed operator contact messages (JSON) as they arrive:
-let _ = guard.accept_contact_json(&incoming);
+Core API:
 
-match guard.check("send_external_message") {
+| Call | What it does |
+| --- | --- |
+| `Guard::new(policy, engine_id, human_keys, next_sequence, audit_log, clock)` | Start a guard. Always starts in `hold`. |
+| `guard.decide(action)` | `Allow`, `NeedsApproval` or `Deny`. Logged. |
+| `guard.tick()` | Re-evaluate the contact level from the clock; log any step-down. Never improves it. |
+| `guard.apply_signed_approval(&msg)` | Contact renewal: restores `connected` only if the signed message passes every check. |
+| `verify_log(...)` / `terminal-guard verify` | Check a log against a signed checkpoint and a pinned audit key. |
+
+`check` and `accept_contact` remain as older names for `decide` and
+`apply_signed_approval`.
+
+A complete, compiled and tested embedding example is in the crate docs
+(`src/lib.rs`, run by `cargo test --doc`). In short:
+
+```rust,ignore
+let mut guard = Guard::new(policy, "agent-01", vec![operator_key], next_seq, audit, SystemClock::new())?;
+let _ = guard.accept_contact_json(&incoming); // operator renewal, if any arrived
+match guard.decide("send_external_message") {
     Decision::Allow => { /* the caller performs the action */ }
-    Decision::NeedsApproval => { /* the caller must get a human approval first */ }
+    Decision::NeedsApproval => { /* the caller must get a human approval for this action first */ }
     Decision::Deny => { /* do not act */ }
 }
 ```
 
-Operators sign contact with `ContactAuth::new(engine_id, sequence, unix_ms).sign(&key)`.
-Key storage and transport of contact messages are up to you.
+Operators sign renewals with `ContactAuth::new(engine_id, sequence, unix_ms).sign(&key)`.
+Key storage and transport of renewal messages are up to you.
+
+### What "signed approval" means
+
+`apply_signed_approval` renews the agent's **contact level**. It is not
+approval of a specific `NeedsApproval` action and does not change what the
+policy allows at `connected`. A valid signature shows that a trusted key
+signed a fresh message for this engine. It is not evidence that a person is
+physically present or reviewed anything.
+
+### Current limitations (0.1.0) vs. the intended design
+
+- **Time comes from a `Clock`, not `tick(now)`.** `tick()` takes no argument;
+  time is injected once through the `Clock` given to `Guard::new`
+  (`MockClock` for deterministic tests, `SystemClock` for real use). A
+  per-call `now` would let a caller freeze or rewind time and stop decay.
+- **The audit log is required and file-based.** `Guard::new` needs an
+  `AuditLog` backed by a log file and a checkpoint file, rewritten on every
+  entry. There is no in-memory or custom log sink yet, and the checkpoint is
+  not optional.
+- **Wall clock.** Freshness of renewals uses the host's wall clock, so the
+  core is deterministic only with `MockClock`.
+- **Not on crates.io.** Git dependency only; no version line to copy yet.
+- **Per-entry fsync.** Every decision fsyncs two files. Fine for agent-speed
+  actions; not built for high-rate calls.
+
+See [ROADMAP.md](ROADMAP.md) for what is planned. None of it exists yet.
 
 ## Security boundary (read this)
 
 - **Decision only.** This crate decides; it does not enforce. The calling
   code must actually refuse denied actions. It does not intercept network
   traffic, system calls or tools.
-- **`NeedsApproval` is not permission.** There is no approval API and no
-  bypass path in this crate. The caller must get and check a human approval
+- **`NeedsApproval` is not permission.** There is no per-action approval API
+  (contact renewal is not one) and no bypass path in this crate. The caller must get and check a human approval
   through its own channel before acting.
 - **Key roles.** Human contact keys and the audit key are separate. The guard
   refuses to start if the audit key is also a trusted human key. The verifier
@@ -145,7 +191,8 @@ src/clock.rs     real and mock clocks
 src/keys.rs      key helpers
 src/bin/terminal-guard.rs   verify / check-policy CLI
 examples/demo.rs            simulated lost-link demo
-tests/                      unit, tamper and property tests
+tests/                      API, unit, tamper and property tests
+ROADMAP.md                  planned work (not yet built)
 policies/example.toml       example policy
 ```
 

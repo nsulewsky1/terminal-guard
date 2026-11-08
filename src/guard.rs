@@ -102,6 +102,45 @@ impl<C: Clock> Guard<C> {
         })
     }
 
+    /// Decide an action. Primary name for [`Self::check`]; identical behavior.
+    ///
+    /// Returns `Deny` on any error, unknown action, malformed name, poisoned
+    /// guard or failed audit write. `NeedsApproval` is not permission: the
+    /// caller must get a human approval for that specific action out of band.
+    pub fn decide(&mut self, action: &str) -> Decision {
+        self.check(action)
+    }
+
+    /// Re-evaluate the contact level against the guard's [`Clock`] and log
+    /// any step-down. Returns the current level (`Hold` on any error).
+    ///
+    /// **API note:** this takes no `now` argument. Time comes only from the
+    /// `Clock` supplied to [`Self::new`] (use [`crate::MockClock`] for
+    /// deterministic tests). A per-call `now` would let a caller freeze or
+    /// rewind time and stop permissions from decaying. Calling `tick` is
+    /// optional: `decide` re-evaluates the level itself. `tick` can never
+    /// improve the level; only [`Self::apply_signed_approval`] can.
+    pub fn tick(&mut self) -> ContactLevel {
+        self.level()
+    }
+
+    /// Apply a signed contact renewal. Primary name for
+    /// [`Self::accept_contact`]; identical behavior.
+    ///
+    /// "Approval" here means a person renewing the agent's *contact level*
+    /// back to `Connected`. It is **not** approval of any particular
+    /// `NeedsApproval` action, and it does not change what the policy allows
+    /// at `Connected`. A valid signature shows a trusted key signed a fresh
+    /// message for this engine; it is not evidence that a person is
+    /// physically present or reviewed anything.
+    ///
+    /// Reconnecting a network alone does nothing; only a new message that
+    /// passes every check (pinned key, domain, engine ID, higher sequence,
+    /// freshness) restores the level.
+    pub fn apply_signed_approval(&mut self, msg: &SignedContact) -> Result<(), ContactError> {
+        self.accept_contact(msg)
+    }
+
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
@@ -126,7 +165,7 @@ impl<C: Clock> Guard<C> {
         }
     }
 
-    /// Decide an action. Returns `Deny` on any error, unknown action,
+    /// Decide an action (compatibility name; prefer [`Self::decide`]). Returns `Deny` on any error, unknown action,
     /// malformed name, poisoned guard or failed audit write.
     ///
     /// `NeedsApproval` means the caller must get a human approval out of band
@@ -163,7 +202,8 @@ impl<C: Clock> Guard<C> {
         Ok(decision)
     }
 
-    /// Offer a signed human contact message. Only an accepted message moves
+    /// Offer a signed human contact message (compatibility name; prefer
+    /// [`Self::apply_signed_approval`]). Only an accepted message moves
     /// the level back to `Connected`. Accepts and rejects are both logged; the
     /// contact is applied only after its log entry is durably written.
     pub fn accept_contact(&mut self, msg: &SignedContact) -> Result<(), ContactError> {
