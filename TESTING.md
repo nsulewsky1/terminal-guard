@@ -13,13 +13,13 @@ you run them with `--ignored`.
 
 | What | Command | Typical time* |
 | --- | --- | --- |
-| Fast suite (51 tests; 4 integration tests listed as ignored) | `cargo test --locked` | ~7 s |
+| Fast suite (54 tests; 4 integration tests listed as ignored) | `cargo test --locked` | ~7 s |
 | Integration suite | `cargo test --locked --test integration_loopback -- --ignored` | ~11 s |
 | Integration, with step log | `cargo test --locked --test integration_loopback -- --ignored --nocapture` | ~11 s |
-| Everything (55 tests) | `cargo test --locked -- --include-ignored` | ~18 s |
+| Everything (58 tests) | `cargo test --locked -- --include-ignored` | ~18 s |
 | Format | `cargo fmt --check` | <1 s |
 | Lint | `cargo clippy --all-targets --locked -- -D warnings` | a few s |
-| Demo | `cargo run --example demo` | <1 s |
+| Demo | `cargo run --example demo` (outside the repo, add `--manifest-path /path/to/terminal-guard/Cargo.toml`) | <1 s |
 
 \*Measured after a build on the development machine (Linux x86_64,
 rustc 1.99.1). First builds take longer. The full suite also passes on
@@ -31,6 +31,11 @@ produced, a missing wall clock must deny, a reopened log must keep its
 replay floor even if the caller passes a lower one, a log for another engine
 is refused, an outside change to the log stops the guard, and oversized
 files are refused before they're read.
+
+`tests/demo.rs` runs the demo into a temporary folder, checks its built-in
+policy matches `policies/example.toml`, verifies the output with the real
+`terminal-guard verify` binary started from an unrelated folder, and checks
+that the demo refuses a folder holding other files.
 
 ## What the integration suite does
 

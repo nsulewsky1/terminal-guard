@@ -83,7 +83,28 @@ mock clock. It exercises the policy logic; it isn't evidence from unplugging
 a real network. The actions are harmless local stand-ins: read a local
 fixture, draft a local note, send an external message, delete a local file.
 Keys are made fresh in memory on each run and private keys are never
-written. Output goes to `demo-out/`, which git ignores. Part of the output:
+written.
+
+The example policy is built into the demo, so it works from any folder.
+Output goes to `demo-out/` under the folder you start it from (git ignores
+it inside the repo), or to the folder you give with `--out DIR`. The demo
+only writes `audit.log`, `audit.checkpoint` and `audit.pub`. It refuses a
+folder that holds anything else, so it can't wipe files you care about.
+
+Cargo needs to find the project, so outside the repo pass `--manifest-path`:
+
+```sh
+cargo run --manifest-path /path/to/terminal-guard/Cargo.toml --example demo
+cargo run --manifest-path /path/to/terminal-guard/Cargo.toml --bin terminal-guard -- verify \
+  --log demo-out/audit.log --checkpoint demo-out/audit.checkpoint \
+  --audit-pubkey demo-out/audit.pub --log-id demo-agent-01
+```
+
+Built binaries work from anywhere too. After `cargo build --examples`, run
+`target/debug/examples/demo` and `target/debug/terminal-guard verify ...`
+from whatever folder you like. The demo prints the absolute paths to use.
+
+Part of the output:
 
 ```text
 t+0      engine start, no contact yet  level=hold      read_local_fixture=deny  draft_local_note=deny  send_external_message=deny  delete_local_file=deny  unlisted_action=deny

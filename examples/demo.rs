@@ -5,12 +5,20 @@
 //! disconnect. All actions are harmless local stand-ins.
 //!
 //! Keys are generated fresh in memory each run and private keys are never
-//! written to disk. Output goes to ./demo-out/ (git-ignored).
+//! written to disk. The example policy is built into the program, so the demo
+//! doesn't depend on the folder you start it from.
 //!
-//! Run: cargo run --example demo
+//! Output goes to `demo-out/` under the current folder, or to the folder given
+//! with `--out DIR`. The demo only writes `audit.log`, `audit.checkpoint` and
+//! `audit.pub` there, and it refuses a folder that holds anything else.
+//!
+//! Run from the repo:   cargo run --example demo
+//! Run from elsewhere:  cargo run --manifest-path /path/to/terminal-guard/Cargo.toml --example demo
+//! Pick the folder:     cargo run --example demo -- --out /some/empty/folder
 
+use std::error::Error;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use terminal_guard::keys::{generate, verifying_key_hex};
@@ -26,18 +34,102 @@ const ACTIONS: [&str; 5] = [
     "delete_local_file",
     "unlisted_action",
 ];
+/// The example policy, embedded at build time.
+pub const EXAMPLE_POLICY: &str = include_str!("../policies/example.toml");
+const OUTPUT_FILES: [&str; 3] = ["audit.log", "audit.checkpoint", "audit.pub"];
+const USAGE: &str = "usage: demo [--out DIR]   (default: ./demo-out)";
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let out = Path::new("demo-out");
-    if out.exists() {
-        fs::remove_dir_all(out)?;
+type DemoResult<T> = Result<T, Box<dyn Error>>;
+
+fn main() {
+    let out = match parse_args(std::env::args().skip(1)) {
+        Ok(Some(out)) => out,
+        Ok(None) => {
+            println!("{USAGE}");
+            return;
+        }
+        Err(e) => {
+            eprintln!("demo: {e}\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = run(&out) {
+        eprintln!("demo: {e}");
+        std::process::exit(1);
     }
-    fs::create_dir_all(out)?;
+}
+
+fn parse_args(mut args: impl Iterator<Item = String>) -> DemoResult<Option<PathBuf>> {
+    let mut out = PathBuf::from("demo-out");
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(None),
+            "--out" => out = PathBuf::from(args.next().ok_or("--out needs a folder")?),
+            other => return Err(format!("unknown argument {other:?}").into()),
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Make `out` ready for a fresh run. Creates it if needed. If it exists, it
+/// must be a real folder (not a symlink) holding nothing but earlier demo
+/// output, which is removed file by file. Nothing else is ever deleted.
+fn prepare_output(out: &Path) -> DemoResult<PathBuf> {
+    match fs::symlink_metadata(out) {
+        Ok(meta) if meta.is_dir() => {
+            for entry in fs::read_dir(out)
+                .map_err(|e| format!("can't read output folder {}: {e}", out.display()))?
+            {
+                let entry = entry?;
+                let name = entry.file_name();
+                let ours = OUTPUT_FILES.iter().any(|f| name == *f);
+                if !ours || !entry.file_type()?.is_file() {
+                    return Err(format!(
+                        "output folder {} holds {:?}, which isn't demo output; \
+                         pick an empty folder with --out",
+                        out.display(),
+                        name
+                    )
+                    .into());
+                }
+            }
+            for f in OUTPUT_FILES {
+                let p = out.join(f);
+                if p.exists() {
+                    fs::remove_file(&p)
+                        .map_err(|e| format!("can't remove old {}: {e}", p.display()))?;
+                }
+            }
+        }
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(format!(
+                "output path {} is a symlink; give the real folder instead",
+                out.display()
+            )
+            .into());
+        }
+        Ok(_) => {
+            return Err(format!("output path {} exists and isn't a folder", out.display()).into());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(out)
+                .map_err(|e| format!("can't create output folder {}: {e}", out.display()))?;
+        }
+        Err(e) => return Err(format!("can't check output folder {}: {e}", out.display()).into()),
+    }
+    Ok(fs::canonicalize(out)?)
+}
+
+/// Run the whole demo, writing its audit files into `out`. Returns the
+/// absolute output folder.
+pub fn run(out: &Path) -> DemoResult<PathBuf> {
+    let out = prepare_output(out)?;
     let log_path = out.join("audit.log");
     let cp_path = out.join("audit.checkpoint");
     let pub_path = out.join("audit.pub");
 
-    let policy = Policy::from_toml(&fs::read_to_string("policies/example.toml")?)?;
+    let policy = Policy::from_toml(EXAMPLE_POLICY)
+        .map_err(|e| format!("built-in example policy is invalid: {e:?}"))?;
 
     // Two separate key roles, ephemeral, in memory only.
     let human_key = generate();
@@ -45,12 +137,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         &pub_path,
         verifying_key_hex(&audit_key.verifying_key()) + "\n",
-    )?;
+    )
+    .map_err(|e| format!("can't write {}: {e}", pub_path.display()))?;
     let pinned_audit = audit_key.verifying_key();
 
     // Fixed start time so the run is deterministic apart from the keys.
     let clock = MockClock::new(1_800_000_000_000);
-    let audit = AuditLog::create(&log_path, &cp_path, ENGINE_ID, audit_key)?;
+    let audit = AuditLog::create(&log_path, &cp_path, ENGINE_ID, audit_key)
+        .map_err(|e| format!("can't create audit log in {}: {e:?}", out.display()))?;
     let mut guard = Guard::new(
         policy,
         ENGINE_ID,
@@ -58,7 +152,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         0,
         audit,
         clock.clone(),
-    )?;
+    )
+    .map_err(|e| format!("can't start guard: {e:?}"))?;
 
     println!("terminal-guard demo (simulated time, simulated lost link)\n");
     step(&mut guard, "t+0      engine start, no contact yet");
@@ -109,20 +204,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &pinned_audit,
         Some(ENGINE_ID),
         VerifyMode::Exact,
-    )?;
+    )
+    .map_err(|e| format!("demo audit log failed verification: {e:?}"))?;
     println!(
         "\naudit log verified: {} entries, head {}",
         report.entries,
         hex::encode(report.head)
     );
+    println!("output folder: {}", out.display());
     println!(
-        "verify yourself:\n  cargo run --bin terminal-guard -- verify --log {} --checkpoint {} --audit-pubkey {} --log-id {}",
+        "verify yourself (from the repo, or add --manifest-path /path/to/terminal-guard/Cargo.toml):\n  \
+         cargo run --bin terminal-guard -- verify --log {} --checkpoint {} --audit-pubkey {} --log-id {}",
         log_path.display(),
         cp_path.display(),
         pub_path.display(),
         ENGINE_ID
     );
-    Ok(())
+    Ok(out)
 }
 
 fn clock_ms(c: &MockClock) -> u64 {
