@@ -51,7 +51,8 @@ Status: early first version (0.1.0). Open source under the
 ## Quick start
 
 ```sh
-cargo test
+cargo test                                                      # fast suite
+cargo test --test integration_loopback -- --ignored             # real-time, multi-process (~11 s)
 cargo run --example demo
 cargo run --bin terminal-guard -- verify \
   --log demo-out/audit.log \
@@ -191,7 +192,9 @@ src/clock.rs     real and mock clocks
 src/keys.rs      key helpers
 src/bin/terminal-guard.rs   verify / check-policy CLI
 examples/demo.rs            simulated lost-link demo
-tests/                      API, unit, tamper and property tests
+tests/                      API, unit, tamper and property tests;
+                            integration_loopback.rs = multi-process loopback suite
+TESTING.md                  how to run the tests and what they show
 ROADMAP.md                  planned work (not yet built)
 policies/example.toml       example policy
 ```
