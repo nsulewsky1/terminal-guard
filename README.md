@@ -1,5 +1,7 @@
 # terminal-guard
 
+[![tests](https://github.com/nsulewsky1/terminal-guard/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/nsulewsky1/terminal-guard/actions/workflows/tests.yml)
+
 Permissions handed to an AI agent don't expire by themselves. If the people
 supervising it go quiet, because the link dropped or the supervisor
 crashed, the agent can keep doing everything it was allowed to do.
@@ -244,6 +246,7 @@ src/bin/terminal-guard.rs   verify / check-policy CLI
 examples/demo.rs            simulated lost-link demo
 tests/                      API, unit, tamper and property tests;
                             integration_loopback.rs = multi-process loopback suite
+.github/workflows/tests.yml GitHub test run (stable and Rust 1.85.1)
 TESTING.md                  how to run the tests and what they show
 THREAT_MODEL.md             assumptions, defenses and gaps
 DIFFERENTIATION.md          related work and what this adds

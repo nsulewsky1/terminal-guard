@@ -1,0 +1,66 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  stable:
+    name: stable (fmt, clippy, tests, docs, demo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # actions/checkout v7.0.1, pinned to its full commit SHA.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      # rustup comes preinstalled on GitHub-hosted Ubuntu runners.
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tests, including the real-time loopback suite
+        run: cargo test --locked -- --include-ignored
+      - run: cargo doc --no-deps --locked
+      - name: Demo from another folder, then verify its log
+        run: |
+          repo="$PWD"
+          cd "$RUNNER_TEMP"
+          cargo run --locked --manifest-path "$repo/Cargo.toml" --example demo
+          cargo run --locked --manifest-path "$repo/Cargo.toml" --bin terminal-guard -- verify \
+            --log demo-out/audit.log \
+            --checkpoint demo-out/audit.checkpoint \
+            --audit-pubkey demo-out/audit.pub \
+            --log-id demo-agent-01
+
+  msrv:
+    name: MSRV 1.85.1 (tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # actions/checkout v7.0.1, pinned to its full commit SHA.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.85.1
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal
+          rustup default 1.85.1
+          rustc --version
+      - name: Tests, including the real-time loopback suite
+        run: cargo test --locked -- --include-ignored

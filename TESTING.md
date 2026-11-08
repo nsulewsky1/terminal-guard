@@ -107,5 +107,14 @@ time and signed renewals do.
 
 ## CI
 
-No hosted CI is set up for this repository yet, and no GitHub checks have
-run. Run the commands above locally.
+`.github/workflows/tests.yml` runs on every push to `main` and every pull
+request. It has read-only access to the repo and uses no secrets. One job
+on stable Rust runs `cargo fmt --check`, clippy with warnings as errors, the
+full suite including the loopback tests, `cargo doc` with warnings as
+errors, and the demo started from a temporary folder followed by `verify`.
+A second job runs the full suite on Rust 1.85.1. The only outside action is
+`actions/checkout`, pinned to a full commit SHA. Rust is installed with the
+runner's own `rustup`.
+
+The badge at the top of the README shows the latest result of that
+workflow on `main`. It isn't a fixed image.
