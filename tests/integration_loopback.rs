@@ -298,6 +298,10 @@ fn handle_link(stream: TcpStream, tx: Sender<Event>) {
             // Over-long line: reject and drop the link.
             let _ = writer.write_all(b"ERR malformed\n");
             break;
+        } else if is_scanner_noise(&line) {
+            // Something other than the harness connected (a port probe).
+            // Do not log it as a contact attempt.
+            continue;
         } else {
             let (rtx, rrx) = mpsc::channel();
             if tx
@@ -314,6 +318,13 @@ fn handle_link(stream: TcpStream, tx: Sender<Event>) {
         }
     }
     let _ = tx.send(Event::Conn(-1));
+}
+
+/// The harness speaks JSON lines, plus one deliberate `not json` probe.
+/// Anything else on the loopback port is a scanner, not a contact attempt.
+fn is_scanner_noise(line: &str) -> bool {
+    let t = line.trim();
+    t.is_empty() || (!t.starts_with('{') && t != "not json")
 }
 
 fn parse_pub(s: &str) -> Result<VerifyingKey, String> {
