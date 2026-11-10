@@ -17,7 +17,24 @@ public key can check.
 
 It runs in-process. There's no daemon and it makes no network calls.
 
-Status: early first version (0.1.0), Apache License 2.0 (see [LICENSE](LICENSE)).
+Status: 0.2.0. Apache License 2.0 (see [LICENSE](LICENSE)).
+
+0.2.0 adds three things on top of 0.1.0:
+
+* A one-time approval for a specific action. It can turn a single
+  `NeedsApproval` into `Allow`. It cannot turn `Deny` into `Allow`, and
+  the same approval cannot be used twice. This is not contact renewal.
+* An exclusive file lock on the audit log. A second process that tries to
+  open the same log gets an error. The lock is per process (`flock`); two
+  writers inside one process are still refused by the file-length check.
+* `terminal-guard mcp-proxy`, which speaks MCP stdio framing and forwards
+  a `tools/call` to a downstream server only when the guard returns
+  `Allow`. Every other message is blocked and is not forwarded.
+
+Not in this release: forward-secure key ratcheting, operator countersignatures
+of the log head, numeric envelopes, and any hardware, GPIO, or vehicle
+control. The library still does not run actions except through the proxy's
+decision to forward or not forward a tool call.
 
 ## How it works
 
@@ -192,9 +209,13 @@ actions, but it isn't built for high call rates.
 This crate decides; it doesn't enforce. Your code has to actually refuse a
 denied action. It doesn't intercept network traffic, system calls or tools.
 
-`NeedsApproval` isn't permission. The crate has no per-action approval API
-(contact renewal isn't one) and no way to bypass a decision. Your code has
-to get and check a human approval through its own channel before acting.
+`NeedsApproval` isn't permission by itself. `decide` does not accept an
+approval. `decide_with_approval` does, for one use of that action, and only
+when the policy already says `needs_approval`. Operators sign one with
+`ActionApproval::new(engine_id, action, id, unix_ms).sign(&key)`. The id is
+an engine-wide nonce. It does not authorize a particular set of arguments,
+and it does not survive a second call or a restart: used ids are stored in
+the audit log.
 
 Human contact keys and the audit key are separate roles, and the guard
 won't start if the audit key is also a trusted human key. Whoever verifies
@@ -222,9 +243,13 @@ the wrong time can accept or reject contact wrongly. Contact age itself uses
 monotonic time. If the wall clock can't be read at all, `decide` returns
 `Deny`.
 
-Only one process should write a given log. The guard checks the file length
-before each append and stops (denying everything) if someone else changed
-the file, but that's a best-effort check, not a lock.
+Only one process should write a given log. `AuditLog` takes a non-blocking
+exclusive `flock` on the log file and holds it until the value is dropped.
+A second process gets `AuditError::Locked`. The lock is per process, so it
+does not by itself stop two writers in the same process; the length check
+still does. A privileged user who can delete the files can still replace
+the log and the checkpoint together. Copy checkpoints somewhere the agent
+host can't rewrite.
 
 If a human key or the audit signing key is stolen, there are no guarantees.
 
