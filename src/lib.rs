@@ -7,6 +7,9 @@
 //! * [`Guard::decide`] maps an action name to [`Decision::Allow`],
 //!   [`Decision::NeedsApproval`] or [`Decision::Deny`]. Any error, unknown
 //!   action or malformed input yields `Deny`.
+//! * [`Guard::decide_with_approval`] can turn one `NeedsApproval` into
+//!   `Allow` for that specific action. The approval is single-use. It cannot
+//!   turn `Deny` into `Allow`.
 //! * Permissions are set per [`ContactLevel`] in a policy file. Levels only get
 //!   more restrictive as time since the last verified human contact grows
 //!   ([`Guard::tick`] or any `decide` call re-evaluates them).
@@ -72,20 +75,25 @@
 //! # }
 //! ```
 //!
-//! This crate makes policy decisions only. The caller must enforce them.
-//! `NeedsApproval` is not permission to act. See the README for the full
-//! security boundary and current limitations.
+//! This crate makes policy decisions only, except for the optional
+//! `mcp-proxy` command, which forwards a tool call only after `Allow`.
+//! `decide` itself does not enforce. `NeedsApproval` from `decide` is not
+//! permission to act. A one-time approval is a separate call, and it cannot
+//! override `Deny`. See the README for the security boundary.
 
 #![forbid(unsafe_code)]
 
+pub mod approval;
 pub mod audit;
 pub mod clock;
 pub mod contact;
 mod encode;
 pub mod guard;
 pub mod keys;
+pub mod mcp;
 pub mod policy;
 
+pub use approval::{ActionApproval, ApprovalError, SignedActionApproval};
 pub use audit::{AuditError, AuditLog, Checkpoint, VerifyMode, VerifyReport, verify_log};
 pub use clock::{Clock, MockClock, SystemClock};
 pub use contact::{ContactAuth, ContactError, ContactTracker, SignedContact};

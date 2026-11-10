@@ -30,3 +30,16 @@ pub fn parse_verifying_key_hex(s: &str) -> Option<VerifyingKey> {
     // Reject small-order / weak keys.
     if k.is_weak() { None } else { Some(k) }
 }
+
+/// Lowercase hex of a signing key's 32-byte seed. This is a secret.
+pub fn signing_key_hex(k: &SigningKey) -> String {
+    hex::encode(k.to_bytes())
+}
+
+/// Parse a 64-hex-character Ed25519 signing-key seed. Surrounding whitespace
+/// is ignored. This parses a private key; do not log the input.
+pub fn parse_signing_key_hex(s: &str) -> Option<SigningKey> {
+    let mut b = [0u8; 32];
+    hex::decode_to_slice(s.trim(), &mut b).ok()?;
+    Some(SigningKey::from_bytes(&b))
+}

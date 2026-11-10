@@ -1,7 +1,7 @@
 # Threat model
 
 This is a short statement of what terminal-guard assumes, what it defends
-against, and what it doesn't. It describes version 0.1.0.
+against, and what it doesn't. It describes version 0.2.0.
 
 ## What it's for
 
@@ -23,9 +23,11 @@ calling code does that.
   decisions are denied.
 - Human contact private keys and the audit signing key stay secret. If any
   of them leak, there are no guarantees.
-- Only one process writes a given log. A second writer is detected on a
-  best-effort basis (the file length is checked before each append) and the
-  guard stops, but there's no file lock.
+- Only one process writes a given log. `AuditLog` holds an exclusive
+  non-blocking `flock` for its lifetime, so a second process cannot open
+  that log. The lock is per process. The file-length check still stops the
+  writer if the file changes underneath it. Neither stops a privileged
+  user from deleting both files.
 
 ## What it defends against
 

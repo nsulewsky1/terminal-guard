@@ -1,7 +1,19 @@
 # Roadmap
 
-These are plans. Nothing below exists in the crate yet, and there are no
-dates.
+## What 0.2.0 adds
+
+Three things, and only these:
+
+1. One-time signed approvals for a specific action. They can satisfy a
+   single `NeedsApproval`. They cannot override `Deny`.
+2. An exclusive file lock on the audit log, held by `AuditLog` and checked
+   against a second process.
+3. `terminal-guard mcp-proxy`, which forwards only `tools/call` requests
+   the guard allows and blocks every other MCP message.
+
+Not built, and not claimed: forward-secure audit-key ratcheting, operator
+countersignatures of the log head, numeric envelopes, or any hardware
+control.
 
 ## What 0.1.0 has
 
