@@ -4,6 +4,7 @@ use std::fmt;
 
 use ed25519_dalek::VerifyingKey;
 
+use crate::approval::{ApprovalError, SignedActionApproval};
 use crate::audit::{AuditError, AuditLog, EntryKind, INVALID_ACTION};
 use crate::clock::Clock;
 use crate::contact::{ContactError, ContactTracker, SignedContact};
@@ -183,13 +184,97 @@ impl<C: Clock> Guard<C> {
     /// malformed name, poisoned guard or failed audit write.
     ///
     /// `NeedsApproval` means the caller must get a human approval out of band
-    /// before acting. It is not permission.
+    /// before acting. It is not permission. Use [`Self::decide_with_approval`]
+    /// to present a one-time approval for this action.
     pub fn check(&mut self, action: &str) -> Decision {
         match self.try_check(action) {
             Ok(d) => d,
             Err(_) => {
                 self.poisoned = true;
                 Decision::Deny
+            }
+        }
+    }
+
+    /// Decide `action`, using `approval` only when the policy says
+    /// `NeedsApproval`.
+    ///
+    /// * `Deny` stays `Deny`. The approval is not inspected and is not
+    ///   consumed, so it can still be used later if the same action becomes
+    ///   `NeedsApproval`.
+    /// * `Allow` stays `Allow`. A supplied approval is not consumed.
+    /// * `NeedsApproval` becomes `Allow` once, if the approval verifies.
+    ///   The id is then dead. A rejected approval leaves the decision at
+    ///   `NeedsApproval` and returns the reason.
+    ///
+    /// An audit failure poisons the guard and consumes nothing.
+    pub fn decide_with_approval(
+        &mut self,
+        action: &str,
+        approval: &SignedActionApproval,
+    ) -> Result<Decision, ApprovalError> {
+        if self.poisoned {
+            return Err(ApprovalError::AuditFailed);
+        }
+        let level = match self.current_level() {
+            Ok(level) => level,
+            Err(_) => {
+                self.poisoned = true;
+                return Err(ApprovalError::AuditFailed);
+            }
+        };
+        let base = if self.clock.unix_ms().is_none() {
+            Decision::Deny
+        } else {
+            self.policy.decide(action, level)
+        };
+        if base != Decision::NeedsApproval {
+            return self
+                .log_decision(level, action, base)
+                .map(|()| base)
+                .map_err(|_| {
+                    self.poisoned = true;
+                    ApprovalError::AuditFailed
+                });
+        }
+        let verified = approval.verify(
+            self.tracker.engine_id(),
+            action,
+            self.tracker.human_keys(),
+            &self.policy,
+            &self.clock,
+            self.audit.used_approval_ids(),
+        );
+        match verified {
+            Ok(id) => {
+                let kind = EntryKind::ApprovedDecision {
+                    action: action.to_string(),
+                    decision: Decision::Allow,
+                    approval_id: id,
+                };
+                if self.audit.append(self.now_ms(), level, kind).is_err() {
+                    self.poisoned = true;
+                    return Err(ApprovalError::AuditFailed);
+                }
+                Ok(Decision::Allow)
+            }
+            Err(e) => {
+                let rejected = EntryKind::ApprovalRejected {
+                    action: logged_action(action),
+                    reason: e.code().to_string(),
+                };
+                if self.audit.append(self.now_ms(), level, rejected).is_err() {
+                    self.poisoned = true;
+                    return Err(ApprovalError::AuditFailed);
+                }
+                if self
+                    .log_decision(level, action, Decision::NeedsApproval)
+                    .is_err()
+                {
+                    self.poisoned = true;
+                    return Err(ApprovalError::AuditFailed);
+                }
+                Err(e)
             }
         }
     }
@@ -207,20 +292,24 @@ impl<C: Clock> Guard<C> {
         } else {
             self.policy.decide(action, level)
         };
-        let logged_action = if valid_ident(action) {
-            action.to_string()
-        } else {
-            INVALID_ACTION.to_string()
-        };
+        self.log_decision(level, action, decision)?;
+        Ok(decision)
+    }
+
+    fn log_decision(
+        &mut self,
+        level: ContactLevel,
+        action: &str,
+        decision: Decision,
+    ) -> Result<(), AuditError> {
         self.audit.append(
             self.now_ms(),
             level,
             EntryKind::Decision {
-                action: logged_action,
+                action: logged_action(action),
                 decision,
             },
-        )?;
-        Ok(decision)
+        )
     }
 
     /// Offer a signed human contact message (compatibility name; prefer
@@ -309,5 +398,13 @@ impl<C: Clock> Guard<C> {
 
     fn now_ms(&self) -> u64 {
         self.clock.unix_ms().unwrap_or(0)
+    }
+}
+
+fn logged_action(action: &str) -> String {
+    if valid_ident(action) {
+        action.to_string()
+    } else {
+        INVALID_ACTION.to_string()
     }
 }
