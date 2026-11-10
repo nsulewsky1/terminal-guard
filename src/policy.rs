@@ -55,8 +55,10 @@ impl fmt::Display for ContactLevel {
 /// Policy decision, ordered from least to most permissive.
 /// `Deny < NeedsApproval < Allow`.
 ///
-/// `NeedsApproval` is NOT permission to execute. This crate has no approval
-/// path; the caller must obtain and enforce a human approval out of band.
+/// `NeedsApproval` is not permission to execute. [`crate::Guard::decide`]
+/// does not take an approval. [`crate::Guard::decide_with_approval`] can
+/// turn one `NeedsApproval` into `Allow` for that action, once. It cannot
+/// change a `Deny`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {

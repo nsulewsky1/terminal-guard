@@ -174,6 +174,14 @@ impl ContactTracker {
         self.next_sequence
     }
 
+    pub(crate) fn engine_id(&self) -> &str {
+        &self.engine_id
+    }
+
+    pub(crate) fn human_keys(&self) -> &[VerifyingKey] {
+        &self.human_keys
+    }
+
     /// Current level. Never improves without [`Self::apply`].
     pub fn level(&mut self, policy: &Policy, clock: &dyn Clock) -> ContactLevel {
         let now = clock.monotonic();
