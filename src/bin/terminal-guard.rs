@@ -6,7 +6,7 @@
 //! terminal-guard hold-lock --log FILE --checkpoint FILE --audit-key-file FILE --log-id ID [--create]
 //! terminal-guard mcp-proxy --policy FILE --engine-id ID --log FILE --checkpoint FILE \
 //!     --audit-key-file FILE --human-pubkey-file FILE [--contact-file FILE] [--create] \
-//!     -- DOWNSTREAM_CMD...
+//!     [--timeout-secs N] -- DOWNSTREAM_CMD...
 //! ```
 //!
 //! Exit codes: 0 = OK, 1 = verification/validation failed, 2 = usage error.
@@ -18,10 +18,16 @@
 use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use terminal_guard::audit::{MAX_LINE_BYTES, MAX_LOG_BYTES, read_bounded};
 use terminal_guard::keys::{parse_signing_key_hex, parse_verifying_key_hex};
-use terminal_guard::mcp::{ProxyOutcome, evaluate, read_frame, write_frame};
+use terminal_guard::mcp::{
+    DownstreamMessage, ProxyOutcome, classify_downstream, error_body, evaluate, read_message,
+    write_message,
+};
 use terminal_guard::policy::MAX_POLICY_BYTES;
 use terminal_guard::{AuditLog, Guard, Policy, SignedContact, SystemClock, VerifyMode, verify_log};
 
@@ -31,13 +37,19 @@ const USAGE: &str = "usage:
   terminal-guard hold-lock --log FILE --checkpoint FILE --audit-key-file FILE --log-id ID [--create]
   terminal-guard mcp-proxy --policy FILE --engine-id ID --log FILE --checkpoint FILE \\
       --audit-key-file FILE --human-pubkey-file FILE [--contact-file FILE] [--create] \\
-      -- DOWNSTREAM_CMD...
+      [--timeout-secs N] -- DOWNSTREAM_CMD...
 
 verify --audit-pubkey is a file holding the trusted audit verifying key (64 hex chars).
 hold-lock and mcp-proxy --audit-key-file is the audit private seed (64 hex chars).
-mcp-proxy forwards only tools/call requests the guard allows. Every other
-MCP message is answered with an error, or dropped if it is a notification,
-and is not sent to DOWNSTREAM_CMD.";
+mcp-proxy speaks MCP over stdio (one JSON message per line). It forwards a
+tools/call only when the guard allows it. initialize, ping, tools/list and the
+initialized/cancelled notifications pass through unchanged. Every other
+message is answered with an error, or dropped if it is a notification, and is
+not sent to DOWNSTREAM_CMD. The proxy exits if the downstream server sends a
+response with the wrong id, sends garbage, exits, or doesn't answer within
+--timeout-secs (default 60).";
+
+const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -263,6 +275,7 @@ struct ProxyArgs {
     human_pubkey_file: String,
     contact_file: Option<String>,
     create: bool,
+    timeout_secs: u64,
     downstream: Vec<String>,
 }
 
@@ -275,6 +288,7 @@ fn parse_proxy_args(args: &[String]) -> Result<ProxyArgs, ExitCode> {
     let mut human_pubkey_file = None;
     let mut contact_file = None;
     let mut create = false;
+    let mut timeout = None;
     let mut downstream = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -290,7 +304,8 @@ fn parse_proxy_args(args: &[String]) -> Result<ProxyArgs, ExitCode> {
             | "--checkpoint"
             | "--audit-key-file"
             | "--human-pubkey-file"
-            | "--contact-file" => {
+            | "--contact-file"
+            | "--timeout-secs" => {
                 let Some(v) = it.next() else {
                     eprintln!("missing value for {a}\n{USAGE}");
                     return Err(ExitCode::from(2));
@@ -303,6 +318,7 @@ fn parse_proxy_args(args: &[String]) -> Result<ProxyArgs, ExitCode> {
                     "--audit-key-file" => &mut audit_key_file,
                     "--human-pubkey-file" => &mut human_pubkey_file,
                     "--contact-file" => &mut contact_file,
+                    "--timeout-secs" => &mut timeout,
                     _ => unreachable!(),
                 };
                 if slot.is_some() {
@@ -317,6 +333,14 @@ fn parse_proxy_args(args: &[String]) -> Result<ProxyArgs, ExitCode> {
             }
         }
     }
+    let timeout_secs = match timeout.as_deref().map(str::parse::<u64>) {
+        None => DEFAULT_TIMEOUT_SECS,
+        Some(Ok(t)) if (1..=3600).contains(&t) => t,
+        Some(_) => {
+            eprintln!("--timeout-secs must be 1 to 3600\n{USAGE}");
+            return Err(ExitCode::from(2));
+        }
+    };
     if downstream.is_empty() {
         eprintln!("mcp-proxy requires a downstream command after --\n{USAGE}");
         return Err(ExitCode::from(2));
@@ -345,6 +369,7 @@ fn parse_proxy_args(args: &[String]) -> Result<ProxyArgs, ExitCode> {
             human_pubkey_file,
             contact_file,
             create,
+            timeout_secs,
             downstream,
         }),
         _ => {
@@ -426,56 +451,56 @@ fn mcp_proxy(args: &[String]) -> ExitCode {
         Some(s) => s,
         None => return fail("downstream stdout missing".into()),
     };
-    let mut downstream_out = BufReader::new(downstream_out);
+    // A reader thread lets the proxy give up on a downstream server that
+    // stops answering, instead of blocking forever.
+    let (tx, rx) = mpsc::channel::<io::Result<Option<String>>>();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(downstream_out);
+        loop {
+            let msg = read_message(&mut reader);
+            let stop = !matches!(msg, Ok(Some(_)));
+            if tx.send(msg).is_err() || stop {
+                break;
+            }
+        }
+    });
+    let timeout = Duration::from_secs(args.timeout_secs);
     let stdin = io::stdin();
     let mut client_in = BufReader::new(stdin.lock());
     let mut client_out = io::stdout();
 
     loop {
-        let frame = match read_frame(&mut client_in) {
-            Ok(Some(f)) => f,
+        let text = match read_message(&mut client_in) {
+            Ok(Some(t)) => t,
             Ok(None) => break,
             Err(e) => {
-                eprintln!("FAIL: client frame: {e}");
+                eprintln!("FAIL: client message: {e}");
                 let _ = child.kill();
                 return ExitCode::from(1);
             }
         };
-        let text = match String::from_utf8(frame) {
-            Ok(t) => t,
-            Err(_) => {
-                let err = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#;
-                let _ = write_frame(&mut client_out, err);
-                continue;
-            }
-        };
         match evaluate(&mut guard, &text) {
-            ProxyOutcome::Forward { request } => {
-                if let Err(e) = write_frame(&mut downstream_in, &request) {
+            ProxyOutcome::Forward { request, id } => {
+                if let Err(e) = write_message(&mut downstream_in, &request) {
                     eprintln!("FAIL: downstream write: {e}");
                     let _ = child.kill();
                     return ExitCode::from(1);
                 }
-                let response = match read_frame(&mut downstream_out) {
-                    Ok(Some(b)) => b,
-                    Ok(None) => {
-                        eprintln!("FAIL: downstream closed");
-                        return ExitCode::from(1);
-                    }
-                    Err(e) => {
-                        eprintln!("FAIL: downstream read: {e}");
-                        let _ = child.kill();
-                        return ExitCode::from(1);
-                    }
-                };
-                if write_frame(&mut client_out, &response).is_err() {
+                let Some(id) = id else { continue };
+                if let Err(why) =
+                    relay_response(&rx, &id, timeout, &mut downstream_in, &mut client_out)
+                {
+                    eprintln!("FAIL: {why}");
+                    let body =
+                        error_body(Some(id), -32003, &format!("terminal-guard: {why}"), None);
+                    let _ = write_message(&mut client_out, &body);
                     let _ = child.kill();
                     return ExitCode::from(1);
                 }
             }
             ProxyOutcome::Block { response } => {
                 if let Some(response) = response {
-                    if write_frame(&mut client_out, &response).is_err() {
+                    if write_message(&mut client_out, &response).is_err() {
                         let _ = child.kill();
                         return ExitCode::from(1);
                     }
@@ -486,4 +511,52 @@ fn mcp_proxy(args: &[String]) -> ExitCode {
     drop(downstream_in);
     let _ = child.wait();
     ExitCode::SUCCESS
+}
+
+/// Wait for the downstream response to `id` and relay it to the client.
+///
+/// Notifications on the way are relayed. Requests from the server are
+/// answered with an error and not relayed. Anything else (bad JSON, a
+/// response with another id, a timeout, the server exiting) is an error, and
+/// the caller shuts the proxy down.
+fn relay_response(
+    rx: &mpsc::Receiver<io::Result<Option<String>>>,
+    id: &serde_json::Value,
+    timeout: Duration,
+    downstream_in: &mut impl Write,
+    client_out: &mut impl Write,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let msg = match rx.recv_timeout(left) {
+            Ok(Ok(Some(m))) => m,
+            Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("downstream server closed".into());
+            }
+            Ok(Err(e)) => return Err(format!("downstream message: {e}")),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err("downstream server timed out".into());
+            }
+        };
+        match classify_downstream(&msg, id) {
+            DownstreamMessage::Response => {
+                return write_message(client_out, &msg).map_err(|e| format!("client write: {e}"));
+            }
+            DownstreamMessage::Notification => {
+                write_message(client_out, &msg).map_err(|e| format!("client write: {e}"))?;
+            }
+            DownstreamMessage::ServerRequest { id: server_id } => {
+                let body = error_body(
+                    Some(server_id),
+                    -32601,
+                    "server requests are not supported through terminal-guard mcp-proxy",
+                    None,
+                );
+                write_message(downstream_in, &body)
+                    .map_err(|e| format!("downstream write: {e}"))?;
+            }
+            DownstreamMessage::Invalid(why) => return Err(format!("downstream sent {why}")),
+        }
+    }
 }
