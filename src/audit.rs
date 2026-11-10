@@ -20,9 +20,10 @@
 //! cannot rewrite and verify against it ([`VerifyMode::Prefix`]). If the audit
 //! signing key is compromised, there are no guarantees at all.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -45,16 +46,34 @@ pub const MAX_LOG_BYTES: usize = 256 * 1024 * 1024;
 pub enum AuditError {
     Io(String),
     MissingCheckpoint,
-    Malformed { line: u64, why: &'static str },
+    Malformed {
+        line: u64,
+        why: &'static str,
+    },
     BadCheckpointSignature,
     LogIdMismatch,
-    BadSequence { line: u64 },
-    BrokenLink { line: u64 },
-    BadSignature { line: u64 },
-    CountMismatch { log: u64, checkpoint: u64 },
+    BadSequence {
+        line: u64,
+    },
+    BrokenLink {
+        line: u64,
+    },
+    BadSignature {
+        line: u64,
+    },
+    CountMismatch {
+        log: u64,
+        checkpoint: u64,
+    },
     HeadMismatch,
     TooLarge,
     InvalidLogId,
+    /// A second process already holds the exclusive lock on this log.
+    Locked,
+    /// An approved-decision entry repeats an approval id.
+    DuplicateApproval {
+        line: u64,
+    },
 }
 
 impl fmt::Display for AuditError {
@@ -81,6 +100,10 @@ impl fmt::Display for AuditError {
             AuditError::HeadMismatch => write!(f, "log head hash does not match checkpoint"),
             AuditError::TooLarge => write!(f, "input exceeds size limit"),
             AuditError::InvalidLogId => write!(f, "invalid log id"),
+            AuditError::Locked => write!(f, "audit log is locked by another process"),
+            AuditError::DuplicateApproval { line } => {
+                write!(f, "duplicate action approval id at line {line}")
+            }
         }
     }
 }
@@ -103,6 +126,14 @@ pub enum EntryKind {
     ContactAccepted { sequence: u64 },
     /// A human contact message was rejected (fixed reason code).
     ContactRejected { reason: String },
+    /// `NeedsApproval` was upgraded to `Allow` by a one-time action approval.
+    ApprovedDecision {
+        action: String,
+        decision: Decision,
+        approval_id: u64,
+    },
+    /// A one-time action approval was rejected and not consumed.
+    ApprovalRejected { action: String, reason: String },
 }
 
 /// One audit entry (without signature).
@@ -141,6 +172,16 @@ impl Entry {
             EntryKind::ContactRejected { reason } => {
                 e.u8(4).str(reason);
             }
+            EntryKind::ApprovedDecision {
+                action,
+                decision,
+                approval_id,
+            } => {
+                e.u8(5).str(action).u8(decision.code()).u64(*approval_id);
+            }
+            EntryKind::ApprovalRejected { action, reason } => {
+                e.u8(6).str(action).str(reason);
+            }
         }
         e.finish()
     }
@@ -174,6 +215,8 @@ struct EntryJson {
     sequence: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approval_id: Option<u64>,
     sig: String,
 }
 
@@ -204,6 +247,7 @@ fn entry_to_json(e: &Entry, sig: &Signature) -> String {
         to: None,
         sequence: None,
         reason: None,
+        approval_id: None,
         sig: hex::encode(sig.to_bytes()),
     };
     match &e.kind {
@@ -224,6 +268,21 @@ fn entry_to_json(e: &Entry, sig: &Signature) -> String {
         }
         EntryKind::ContactRejected { reason } => {
             j.kind = "contact_rejected".into();
+            j.reason = Some(reason.clone());
+        }
+        EntryKind::ApprovedDecision {
+            action,
+            decision,
+            approval_id,
+        } => {
+            j.kind = "approved_decision".into();
+            j.action = Some(action.clone());
+            j.decision = Some(decision.as_str().into());
+            j.approval_id = Some(*approval_id);
+        }
+        EntryKind::ApprovalRejected { action, reason } => {
+            j.kind = "approval_rejected".into();
+            j.action = Some(action.clone());
             j.reason = Some(reason.clone());
         }
     }
@@ -253,10 +312,11 @@ fn entry_from_json(line: &str, n: u64) -> Result<(Entry, Signature), AuditError>
         j.to.is_some(),
         j.sequence.is_some(),
         j.reason.is_some(),
+        j.approval_id.is_some(),
     );
     let kind = match (j.kind.as_str(), fields) {
-        ("start", (false, false, false, false, false, false)) => EntryKind::Start,
-        ("decision", (true, true, false, false, false, false)) => {
+        ("start", (false, false, false, false, false, false, false)) => EntryKind::Start,
+        ("decision", (true, true, false, false, false, false, false)) => {
             let action = j.action.unwrap_or_default();
             if !valid_ident(&action) && action != INVALID_ACTION {
                 return Err(bad("bad action"));
@@ -265,23 +325,49 @@ fn entry_from_json(line: &str, n: u64) -> Result<(Entry, Signature), AuditError>
                 .ok_or(bad("bad decision"))?;
             EntryKind::Decision { action, decision }
         }
-        ("level_changed", (false, false, true, true, false, false)) => EntryKind::LevelChanged {
-            from: ContactLevel::from_str_strict(j.from.as_deref().unwrap_or(""))
-                .ok_or(bad("bad level"))?,
-            to: ContactLevel::from_str_strict(j.to.as_deref().unwrap_or(""))
-                .ok_or(bad("bad level"))?,
-        },
-        ("contact_accepted", (false, false, false, false, true, false)) => {
+        ("level_changed", (false, false, true, true, false, false, false)) => {
+            EntryKind::LevelChanged {
+                from: ContactLevel::from_str_strict(j.from.as_deref().unwrap_or(""))
+                    .ok_or(bad("bad level"))?,
+                to: ContactLevel::from_str_strict(j.to.as_deref().unwrap_or(""))
+                    .ok_or(bad("bad level"))?,
+            }
+        }
+        ("contact_accepted", (false, false, false, false, true, false, false)) => {
             EntryKind::ContactAccepted {
                 sequence: j.sequence.unwrap_or_default(),
             }
         }
-        ("contact_rejected", (false, false, false, false, false, true)) => {
+        ("contact_rejected", (false, false, false, false, false, true, false)) => {
             let reason = j.reason.unwrap_or_default();
             if !valid_ident(&reason) {
                 return Err(bad("bad reason"));
             }
             EntryKind::ContactRejected { reason }
+        }
+        ("approved_decision", (true, true, false, false, false, false, true)) => {
+            let action = j.action.unwrap_or_default();
+            if !valid_ident(&action) {
+                return Err(bad("bad action"));
+            }
+            let decision = Decision::from_str_strict(j.decision.as_deref().unwrap_or(""))
+                .ok_or(bad("bad decision"))?;
+            if decision != Decision::Allow {
+                return Err(bad("approved decision must be allow"));
+            }
+            EntryKind::ApprovedDecision {
+                action,
+                decision,
+                approval_id: j.approval_id.unwrap_or_default(),
+            }
+        }
+        ("approval_rejected", (true, false, false, false, false, true, false)) => {
+            let action = j.action.unwrap_or_default();
+            let reason = j.reason.unwrap_or_default();
+            if (!valid_ident(&action) && action != INVALID_ACTION) || !valid_ident(&reason) {
+                return Err(bad("bad action or reason"));
+            }
+            EntryKind::ApprovalRejected { action, reason }
         }
         _ => return Err(bad("unknown kind or wrong fields")),
     };
@@ -392,6 +478,8 @@ pub struct VerifyReport {
     pub checkpoint_count: u64,
     pub last_contact_sequence: Option<u64>,
     pub final_level: Option<ContactLevel>,
+    /// Approval ids consumed by `approved_decision` entries.
+    pub used_approval_ids: BTreeSet<u64>,
 }
 
 /// Verify log text against checkpoint text using a pinned audit key.
@@ -426,6 +514,7 @@ pub fn verify_log(
     };
     let mut last_contact_sequence = None;
     let mut final_level = None;
+    let mut used_approval_ids = BTreeSet::new();
     for (i, line) in log_text.lines().enumerate() {
         let n = i as u64 + 1;
         let (entry, sig) = entry_from_json(line, n)?;
@@ -453,8 +542,13 @@ pub fn verify_log(
         if count == cp.count {
             head_at_checkpoint = Some(head);
         }
-        if let EntryKind::ContactAccepted { sequence } = entry.kind {
-            last_contact_sequence = Some(sequence);
+        if let EntryKind::ContactAccepted { sequence } = &entry.kind {
+            last_contact_sequence = Some(*sequence);
+        }
+        if let EntryKind::ApprovedDecision { approval_id, .. } = &entry.kind {
+            if !used_approval_ids.insert(*approval_id) {
+                return Err(AuditError::DuplicateApproval { line: n });
+            }
         }
         final_level = Some(entry.level);
     }
@@ -489,6 +583,7 @@ pub fn verify_log(
         checkpoint_count: cp.count,
         last_contact_sequence,
         final_level,
+        used_approval_ids,
     })
 }
 
@@ -521,6 +616,19 @@ fn io<E: fmt::Display>(e: E) -> AuditError {
     AuditError::Io(e.to_string())
 }
 
+/// Non-blocking exclusive lock. The lock lasts until `file` is closed.
+///
+/// On Unix this is `flock`. Locks are per process, so a second `AuditLog` in
+/// the *same* process does not conflict; a second process does.
+fn lock_exclusive(file: &File) -> Result<(), AuditError> {
+    use fs4::fs_std::FileExt;
+    match file.try_lock_exclusive() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AuditError::Locked),
+        Err(e) => Err(io(e)),
+    }
+}
+
 /// Append-only writer for a log + checkpoint pair.
 pub struct AuditLog {
     log_path: PathBuf,
@@ -530,9 +638,12 @@ pub struct AuditLog {
     count: u64,
     head: [u8; 32],
     last_contact_sequence: Option<u64>,
+    used_approvals: BTreeSet<u64>,
     /// Bytes we expect the log file to hold. A mismatch before an append
     /// means someone else changed the file, so the append fails closed.
     expected_len: u64,
+    /// Held open so the exclusive lock survives for the life of this writer.
+    log_file: File,
 }
 
 impl fmt::Debug for AuditLog {
@@ -559,12 +670,14 @@ impl AuditLog {
         if checkpoint_path.exists() {
             return Err(AuditError::Io("checkpoint already exists".into()));
         }
-        let f = OpenOptions::new()
-            .write(true)
+        let log_file = OpenOptions::new()
+            .read(true)
+            .append(true)
             .create_new(true)
             .open(log_path)
             .map_err(io)?;
-        f.sync_all().map_err(io)?;
+        lock_exclusive(&log_file)?;
+        log_file.sync_all().map_err(io)?;
         let log = AuditLog {
             log_path: log_path.to_path_buf(),
             checkpoint_path: checkpoint_path.to_path_buf(),
@@ -573,7 +686,9 @@ impl AuditLog {
             count: 0,
             head: GENESIS_HASH,
             last_contact_sequence: None,
+            used_approvals: BTreeSet::new(),
             expected_len: 0,
+            log_file,
         };
         log.write_checkpoint()?;
         Ok(log)
@@ -600,6 +715,18 @@ impl AuditLog {
             Some(log_id),
             VerifyMode::Exact,
         )?;
+        let log_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(log_path)
+            .map_err(io)?;
+        lock_exclusive(&log_file)?;
+        let len = log_file.metadata().map_err(io)?.len();
+        if len != log_text.len() as u64 {
+            return Err(AuditError::Io(
+                "log file changed before the lock was acquired".into(),
+            ));
+        }
         let log = AuditLog {
             log_path: log_path.to_path_buf(),
             checkpoint_path: checkpoint_path.to_path_buf(),
@@ -608,7 +735,9 @@ impl AuditLog {
             count: report.entries,
             head: report.head,
             last_contact_sequence: report.last_contact_sequence,
+            used_approvals: report.used_approval_ids.clone(),
             expected_len: log_text.len() as u64,
+            log_file,
         };
         Ok((log, report))
     }
@@ -627,6 +756,11 @@ impl AuditLog {
         self.last_contact_sequence
     }
 
+    /// Ids of one-time action approvals already recorded in this log.
+    pub fn used_approval_ids(&self) -> &BTreeSet<u64> {
+        &self.used_approvals
+    }
+
     /// Append one entry, fsync it, then rewrite the checkpoint.
     pub fn append(
         &mut self,
@@ -634,6 +768,13 @@ impl AuditLog {
         level: ContactLevel,
         kind: EntryKind,
     ) -> Result<(), AuditError> {
+        if let EntryKind::ApprovedDecision { approval_id, .. } = &kind {
+            if self.used_approvals.contains(approval_id) {
+                return Err(AuditError::DuplicateApproval {
+                    line: self.count + 1,
+                });
+            }
+        }
         let entry = Entry {
             log_id: self.log_id.clone(),
             seq: self.count,
@@ -649,29 +790,53 @@ impl AuditLog {
             return Err(AuditError::TooLarge);
         }
         line.push('\n');
-        let mut f = OpenOptions::new()
-            .append(true)
-            .open(&self.log_path)
+        // The lock stops a second process. This check stops a path that was
+        // deleted or replaced, which the open file descriptor would otherwise
+        // keep writing to.
+        self.ensure_log_path()?;
+        self.log_file
+            .seek(SeekFrom::Start(self.expected_len))
             .map_err(io)?;
-        // Single writer only. If the file isn't the length we left it at,
-        // another writer or an edit got in, and continuing would fork the
-        // chain. This is a best-effort check, not a lock.
-        let len = f.metadata().map_err(io)?.len();
-        if len != self.expected_len {
-            return Err(AuditError::Io(format!(
-                "log file changed underneath the writer (expected {} bytes, found {len})",
-                self.expected_len
-            )));
-        }
-        f.write_all(line.as_bytes()).map_err(io)?;
-        f.sync_data().map_err(io)?;
+        self.log_file.write_all(line.as_bytes()).map_err(io)?;
+        self.log_file.sync_data().map_err(io)?;
         self.expected_len += line.len() as u64;
         self.head = Sha256::digest(&bytes).into();
         self.count += 1;
-        if let EntryKind::ContactAccepted { sequence } = entry.kind {
-            self.last_contact_sequence = Some(sequence);
+        match &entry.kind {
+            EntryKind::ContactAccepted { sequence } => {
+                self.last_contact_sequence = Some(*sequence);
+            }
+            EntryKind::ApprovedDecision { approval_id, .. } => {
+                self.used_approvals.insert(*approval_id);
+            }
+            _ => {}
         }
         self.write_checkpoint()
+    }
+
+    fn ensure_log_path(&self) -> Result<(), AuditError> {
+        let live = self.log_file.metadata().map_err(io)?;
+        if live.len() != self.expected_len {
+            return Err(AuditError::Io(format!(
+                "log file changed underneath the writer (expected {} bytes, found {})",
+                self.expected_len,
+                live.len()
+            )));
+        }
+        let on_path = std::fs::metadata(&self.log_path)
+            .map_err(|_| AuditError::Io("log path disappeared or is not the locked file".into()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if on_path.dev() != live.dev() || on_path.ino() != live.ino() {
+                return Err(AuditError::Io(
+                    "log path no longer refers to the locked file".into(),
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = on_path;
+        Ok(())
     }
 
     fn write_checkpoint(&self) -> Result<(), AuditError> {
