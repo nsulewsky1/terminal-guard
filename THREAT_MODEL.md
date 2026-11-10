@@ -23,11 +23,16 @@ calling code does that.
   decisions are denied.
 - Human contact private keys and the audit signing key stay secret. If any
   of them leak, there are no guarantees.
-- Only one process writes a given log. `AuditLog` holds an exclusive
-  non-blocking `flock` for its lifetime, so a second process cannot open
-  that log. The lock is per process. The file-length check still stops the
-  writer if the file changes underneath it. Neither stops a privileged
-  user from deleting both files.
+- Only one writer uses a given log. `AuditLog` holds an exclusive,
+  non-blocking, advisory lock (`flock` on Unix) for its lifetime, so a
+  second open of that log fails, from another process or the same one. A
+  process that ignores the lock isn't stopped by it, but the file-length and
+  file-identity checks stop the guard if the file changes or is replaced
+  underneath it. None of this stops someone with access to the files from
+  deleting or replacing both of them.
+- Whoever holds a trusted human key is trusted to sign both contact
+  renewals and one-time action approvals. There's no separate approval key
+  role yet.
 
 ## What it defends against
 
@@ -43,6 +48,17 @@ calling code does that.
   recorded there, whatever the caller passes in.
 - Editing or deleting log entries, including the newest, when you verify
   against the trusted latest checkpoint and a pinned audit public key.
+- Using an action approval to get more than one call: the signed
+  approval names one engine and one action, carries a unique id, is
+  checked with strict Ed25519 verification, and expires with the policy's
+  contact freshness window. A used id is recorded in the audit log and
+  refused after a reopen of that log. An approval can't turn `Deny` into
+  anything else, can't renew contact, and a contact message can't be used as
+  an approval.
+- Through `mcp-proxy`: a tool call that isn't `Allow` never reaches the MCP
+  server, and the server can't answer for a request it wasn't sent, because
+  only a response with the forwarded id is relayed. A server that crashes,
+  hangs or sends garbage stops the proxy.
 - Oversized or malformed inputs: policy files, checkpoints, logs and renewal
   messages have size limits and strict parsing, and any error ends in a
   denial.
@@ -61,7 +77,17 @@ calling code does that.
   is a valid message. Short freshness windows limit this.
 - Proof that a person was present. A signature shows a trusted key signed a
   fresh message, nothing more.
-- Anything outside the decision: network traffic, tool calls, model output.
+- Anything outside the decision: network traffic, model output, and tool
+  calls that don't go through `mcp-proxy`.
+- What an approved action does. An approval covers an action name, not its
+  arguments, so one approval of `send_external_message` allows one call with
+  any content.
+- A lost or replaced log, for approvals too: the record of used approval
+  ids goes with it.
+- MCP traffic the proxy passes on purpose: `initialize`, `ping`,
+  `tools/list` and their notifications go through without a guard decision,
+  and `tools/list` isn't filtered, so the client can see tools it can't
+  call.
 
 ## Known gaps
 
@@ -70,5 +96,9 @@ calling code does that.
 - Two files are fsynced on every decision. No throughput measurements have
   been made.
 - No independent security review has been done.
+- `mcp-proxy` has been tested only against a stand-in server in this repo,
+  not against real MCP clients or servers. It reads contact once at
+  startup, so it ends up in `hold` until restarted with a fresh contact
+  message.
 - Integration tests run two processes on one machine over loopback. They
   aren't evidence about physical network loss or separate hosts.

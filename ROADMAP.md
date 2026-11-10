@@ -4,16 +4,21 @@
 
 Three things, and only these:
 
-1. One-time signed approvals for a specific action. They can satisfy a
-   single `NeedsApproval`. They cannot override `Deny`.
-2. An exclusive file lock on the audit log, held by `AuditLog` and checked
-   against a second process.
-3. `terminal-guard mcp-proxy`, which forwards only `tools/call` requests
-   the guard allows and blocks every other MCP message.
+1. One-time signed approvals for a named action. They can satisfy a
+   single `NeedsApproval`. They can't override `Deny`. They don't cover
+   arguments.
+2. An exclusive file lock on the audit log, held by `AuditLog`.
+3. `terminal-guard mcp-proxy`, which forwards a `tools/call` only when the
+   guard allows it, passes the read-only MCP session messages, and blocks
+   everything else.
 
-Not built, and not claimed: forward-secure audit-key ratcheting, operator
-countersignatures of the log head, numeric envelopes, or any hardware
-control.
+Not built, and not claimed: audit-key ratcheting, operator
+countersignatures of the log head, numeric limits, or any hardware
+control. Hardware control isn't planned for this repository.
+
+Candidates for later, if review supports them: a live contact renewal
+channel for the proxy, approvals bound to a hash of the arguments, a
+separate approval key role, and filtering `tools/list` by policy.
 
 ## What 0.1.0 has
 
@@ -23,6 +28,8 @@ hash-chained log records the contact level in every entry. This core stays
 free and open source under Apache 2.0.
 
 ## Planned, roughly in order
+
+These are plans. Nothing below exists yet, and there are no dates.
 
 1. Easier embedding: optional checkpointing, an in-memory or custom log
    sink, and fewer filesystem assumptions in the core.

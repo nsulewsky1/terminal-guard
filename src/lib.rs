@@ -76,7 +76,8 @@
 //! ```
 //!
 //! This crate makes policy decisions only, except for the optional
-//! `mcp-proxy` command, which forwards a tool call only after `Allow`.
+//! `mcp-proxy` command, which forwards a `tools/call` only after `Allow`
+//! (see [`mcp`]).
 //! `decide` itself does not enforce. `NeedsApproval` from `decide` is not
 //! permission to act. A one-time approval is a separate call, and it cannot
 //! override `Deny`. See the README for the security boundary.

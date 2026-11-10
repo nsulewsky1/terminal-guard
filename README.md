@@ -15,26 +15,33 @@ that. Only a new message signed with a trusted human contact key does. Every
 decision is written to a signed, hash-chained log that anyone with the audit
 public key can check.
 
-It runs in-process. There's no daemon and it makes no network calls.
+The library runs in-process. There's no daemon and it makes no network
+calls. The optional `terminal-guard mcp-proxy` command runs as a separate
+process between an MCP client and one MCP server over stdio.
 
-Status: 0.2.0. Apache License 2.0 (see [LICENSE](LICENSE)).
+Status: 0.2.0, experimental and unaudited. Nobody outside the project has
+reviewed it, and it has no deployment history. Apache License 2.0 (see
+[LICENSE](LICENSE)).
 
-0.2.0 adds three things on top of 0.1.0:
+0.2.0 adds three things on top of 0.1.0 (details in
+[CHANGELOG.md](CHANGELOG.md)):
 
-* A one-time approval for a specific action. It can turn a single
-  `NeedsApproval` into `Allow`. It cannot turn `Deny` into `Allow`, and
-  the same approval cannot be used twice. This is not contact renewal.
-* An exclusive file lock on the audit log. A second process that tries to
-  open the same log gets an error. The lock is per process (`flock`); two
-  writers inside one process are still refused by the file-length check.
-* `terminal-guard mcp-proxy`, which speaks MCP stdio framing and forwards
-  a `tools/call` to a downstream server only when the guard returns
-  `Allow`. Every other message is blocked and is not forwarded.
+* A one-time signed approval for a named action. It can turn a single
+  `NeedsApproval` into `Allow`. It can't turn `Deny` into anything else, and
+  a used approval id is refused from then on, including after the log is
+  reopened. It covers the action name only, not its arguments. It isn't
+  contact renewal.
+* An exclusive file lock on the audit log, held for as long as the
+  `AuditLog` value lives. A second open of the same log, from another
+  process or the same one, gets `AuditError::Locked`.
+* `terminal-guard mcp-proxy`, which sits between an MCP client and one MCP
+  server on stdio. It forwards a `tools/call` only when the guard returns
+  `Allow`, passes the read-only session messages a client needs
+  (`initialize`, `ping`, `tools/list` and two notifications), and blocks
+  everything else.
 
-Not in this release: forward-secure key ratcheting, operator countersignatures
-of the log head, numeric envelopes, and any hardware, GPIO, or vehicle
-control. The library still does not run actions except through the proxy's
-decision to forward or not forward a tool call.
+Not in this release: key ratcheting, operator countersignatures of the log
+head, numeric limits, and any hardware or vehicle control.
 
 ## How it works
 
@@ -152,6 +159,7 @@ The core API:
 | `guard.decide(action)` | `Allow`, `NeedsApproval` or `Deny`. Logged. |
 | `guard.tick()` | Re-evaluate the contact level from the clock; log any step-down. Never improves it. |
 | `guard.apply_signed_approval(&msg)` | Contact renewal: restores `connected` only if the signed message passes every check. |
+| `guard.decide_with_approval(action, &approval)` | Like `decide`, but a valid one-time approval turns `NeedsApproval` into `Allow` once. `Deny` and `Allow` pass through unchanged and the approval isn't used up. |
 | `verify_log(...)` / `terminal-guard verify` | Check a log against a signed checkpoint and a pinned audit key. |
 
 `check` and `accept_contact` still work as older names for `decide` and
@@ -175,13 +183,33 @@ How you store keys and deliver renewal messages is up to you.
 
 ### What "signed approval" means here
 
-`apply_signed_approval` renews the agent's contact level. It doesn't approve
-any specific `NeedsApproval` action, and it doesn't change what the policy
-allows at `connected`. A valid signature shows that a trusted key signed a
+There are two signed messages, and they can't stand in for each other.
+
+`apply_signed_approval` renews the agent's contact level. Despite the name,
+it doesn't approve any specific action, and it doesn't change what the
+policy allows at `connected`.
+
+`decide_with_approval` takes a one-time action approval, signed with a
+trusted human key: `ActionApproval::new(engine_id, action, id, unix_ms).sign(&key)`.
+The signed bytes are length-prefixed and carry their own magic, version and
+domain string, separate from contact messages and audit entries. The guard
+checks the domain, engine id, action name, signature (strict Ed25519), that
+the id is unused, and that the timestamp is within the policy's contact
+freshness window (`max_age_secs`, `max_future_skew_secs`). That window is
+the only expiry. A used id is recorded in the audit log, so it stays used
+after a restart as long as the same log is reopened. Rejected approvals are
+logged with a reason and aren't used up. An approval doesn't change the
+contact level.
+
+The approval names an action, not its arguments. An approval for
+`send_external_message` lets one call of that action through, whatever it
+sends.
+
+In both cases a valid signature shows that a trusted key signed a
 fresh message for this engine. It doesn't show that a person was physically
 present or reviewed anything.
 
-### Current limitations (0.1.0)
+### Current limitations
 
 `tick()` takes no `now` argument. Time comes from the `Clock` you pass to
 `Guard::new`: `MockClock` for deterministic tests, `SystemClock` for real
@@ -204,18 +232,69 @@ actions, but it isn't built for high call rates.
 
 [ROADMAP.md](ROADMAP.md) lists what's planned. None of it exists yet.
 
+## MCP proxy
+
+`terminal-guard mcp-proxy` starts one MCP server as a child process and sits
+between it and an MCP client, on stdio, using the MCP stdio framing (one
+JSON-RPC message per line). It doesn't open any network port.
+
+```sh
+terminal-guard mcp-proxy --policy policy.toml --engine-id agent-01 \
+  --log audit.log --checkpoint audit.checkpoint --create \
+  --audit-key-file audit.seed --human-pubkey-file operator.pub \
+  --contact-file contact.json [--timeout-secs 60] \
+  -- /path/to/mcp-server --its --args
+```
+
+What it does with each client message:
+
+| Message | What happens |
+| --- | --- |
+| `tools/call` with an id | Guard decision on the tool name. Forwarded only on `Allow`, with `_terminal_guard_approval` removed from the params. `Deny` gets error -32002 and `NeedsApproval` gets -32001; neither reaches the server. |
+| `tools/call` with an approval | A signed approval under `params._terminal_guard_approval` can turn one `NeedsApproval` into `Allow`. It never changes `Deny`. |
+| `initialize`, `ping`, `tools/list` | Passed through unchanged, without a guard decision. They don't run a tool. |
+| `notifications/initialized`, `notifications/cancelled` | Passed through. |
+| Anything else (other methods, `tools/call` notifications, batches, wrong `jsonrpc` version, bad JSON) | Not forwarded. Requests get an error; notifications and responses are dropped. |
+
+On the way back, only a response whose id matches the forwarded request is
+passed to the client. Server notifications are passed along. Requests from
+the server (for example sampling) are answered with an error and not
+passed to the client. If the server sends a response with another id,
+sends something that isn't JSON-RPC, exits, or doesn't answer within
+`--timeout-secs`, the client gets error -32003 for its request and the
+proxy exits. A client message over 1 MiB also stops the proxy.
+
+Limits worth knowing:
+
+* Contact comes from one `--contact-file` read at startup. There's no live
+  renewal channel yet, so after the policy's thresholds pass the proxy
+  steps down to `hold` and stays there until it's restarted with a fresh
+  contact message.
+* `tools/list` isn't filtered by policy, so the client sees tools it may
+  not be allowed to call.
+* Resources, prompts, completions and other MCP features are blocked
+  rather than reviewed one by one. Servers that depend on them won't work
+  through the proxy.
+* Requests are handled one at a time, and server notifications are only
+  relayed while a request is waiting for its response.
+* `--audit-key-file` is the audit private key, stored in a file as 64 hex
+  characters. Keep it readable only by the account that runs the proxy.
+* It has only been tested against the stand-in server in `src/bin/mcp_echo.rs`,
+  not against real MCP clients or servers.
+
 ## Security boundary
 
-This crate decides; it doesn't enforce. Your code has to actually refuse a
-denied action. It doesn't intercept network traffic, system calls or tools.
+The library decides; it doesn't enforce. Your code has to actually refuse a
+denied action. It doesn't intercept network traffic or system calls. The
+only enforcement is the optional MCP proxy, and only for tool calls that go
+through it.
 
-`NeedsApproval` isn't permission by itself. `decide` does not accept an
-approval. `decide_with_approval` does, for one use of that action, and only
-when the policy already says `needs_approval`. Operators sign one with
-`ActionApproval::new(engine_id, action, id, unix_ms).sign(&key)`. The id is
-an engine-wide nonce. It does not authorize a particular set of arguments,
-and it does not survive a second call or a restart: used ids are stored in
-the audit log.
+`NeedsApproval` isn't permission by itself. `decide` never accepts an
+approval. `decide_with_approval` accepts one, for one use of that action
+name, and only when the policy already says `needs_approval` at the current
+level. If the log is lost or replaced with a fresh one, the record of used
+approval ids is lost with it, and an approval that's still fresh could be
+used again.
 
 Human contact keys and the audit key are separate roles, and the guard
 won't start if the audit key is also a trusted human key. Whoever verifies
@@ -243,18 +322,20 @@ the wrong time can accept or reject contact wrongly. Contact age itself uses
 monotonic time. If the wall clock can't be read at all, `decide` returns
 `Deny`.
 
-Only one process should write a given log. `AuditLog` takes a non-blocking
-exclusive `flock` on the log file and holds it until the value is dropped.
-A second process gets `AuditError::Locked`. The lock is per process, so it
-does not by itself stop two writers in the same process; the length check
-still does. A privileged user who can delete the files can still replace
+Only one writer should use a given log. `AuditLog` takes a non-blocking
+exclusive lock on the log file (`flock` on Unix, through the `fs4` crate)
+and holds it until the value is dropped. A second open of the same log gets
+`AuditError::Locked`. The lock is advisory: it stops other terminal-guard
+writers, not a process that ignores it. The file-length and file-identity
+checks before each append still stop the guard if the file changes or is
+replaced underneath it. A user who can delete the files can still replace
 the log and the checkpoint together. Copy checkpoints somewhere the agent
 host can't rewrite.
 
 If a human key or the audit signing key is stolen, there are no guarantees.
 
-This is an early open-source library with no formal certification, audit or
-deployment history. [THREAT_MODEL.md](THREAT_MODEL.md) lists the
+This is an experimental open-source library with no certification,
+independent audit or deployment history. [THREAT_MODEL.md](THREAT_MODEL.md) lists the
 assumptions and gaps in one place, and
 [DIFFERENTIATION.md](DIFFERENTIATION.md) compares it with related projects.
 
@@ -267,7 +348,10 @@ src/audit.rs     audit log, checkpoint, verification
 src/guard.rs     the engine that ties them together
 src/clock.rs     real and mock clocks
 src/keys.rs      key helpers
-src/bin/terminal-guard.rs   verify / check-policy CLI
+src/approval.rs  one-time action approvals
+src/mcp.rs       MCP proxy message rules and stdio framing
+src/bin/terminal-guard.rs   verify / check-policy / mcp-proxy / hold-lock CLI
+src/bin/mcp_echo.rs         stand-in MCP server used by the proxy tests
 examples/demo.rs            simulated lost-link demo
 tests/                      API, unit, tamper and property tests;
                             integration_loopback.rs = multi-process loopback suite
@@ -276,13 +360,15 @@ TESTING.md                  how to run the tests and what they show
 THREAT_MODEL.md             assumptions, defenses and gaps
 DIFFERENTIATION.md          related work and what this adds
 ROADMAP.md                  planned work (not yet built)
+CHANGELOG.md                what changed in each version
 policies/example.toml       example policy
 ```
 
 ## Dependencies
 
 `ed25519-dalek` for signatures, `sha2` for hashing, `serde`, `serde_json`
-and `toml` for parsing, and `proptest` for property tests. There's no custom
+and `toml` for parsing, `fs4` for the file lock, and `proptest` for
+property tests. There's no custom
 cryptography. Minimum Rust version: 1.85.
 
 ## License
