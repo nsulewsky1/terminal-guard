@@ -618,8 +618,10 @@ fn io<E: fmt::Display>(e: E) -> AuditError {
 
 /// Non-blocking exclusive lock. The lock lasts until `file` is closed.
 ///
-/// On Unix this is `flock`. Locks are per process, so a second `AuditLog` in
-/// the *same* process does not conflict; a second process does.
+/// On Unix this is `flock` (through `fs4`). The lock belongs to the open
+/// file, so a second `AuditLog` on the same path conflicts whether it's in
+/// another process or this one. It's advisory: a writer that doesn't ask
+/// for the lock isn't stopped by it.
 fn lock_exclusive(file: &File) -> Result<(), AuditError> {
     use fs4::fs_std::FileExt;
     match file.try_lock_exclusive() {
@@ -702,6 +704,17 @@ impl AuditLog {
         log_id: &str,
         key: SigningKey,
     ) -> Result<(Self, VerifyReport), AuditError> {
+        if !checkpoint_path.exists() {
+            return Err(AuditError::MissingCheckpoint);
+        }
+        // Take the lock before reading, so the log can't change between
+        // verification and the first append.
+        let log_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(log_path)
+            .map_err(io)?;
+        lock_exclusive(&log_file)?;
         let log_text = read_bounded(log_path, MAX_LOG_BYTES)?;
         let cp_text = match read_bounded(checkpoint_path, MAX_LINE_BYTES) {
             Ok(t) => t,
@@ -715,16 +728,10 @@ impl AuditLog {
             Some(log_id),
             VerifyMode::Exact,
         )?;
-        let log_file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(log_path)
-            .map_err(io)?;
-        lock_exclusive(&log_file)?;
         let len = log_file.metadata().map_err(io)?.len();
         if len != log_text.len() as u64 {
             return Err(AuditError::Io(
-                "log file changed before the lock was acquired".into(),
+                "log file changed while it was being verified".into(),
             ));
         }
         let log = AuditLog {

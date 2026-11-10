@@ -55,3 +55,18 @@ fn second_process_cannot_open_a_locked_log() {
     assert_eq!(report.entries, 0);
     drop(reopened);
 }
+
+#[test]
+fn second_open_in_the_same_process_is_also_refused() {
+    // flock locks belong to the open file, so a second AuditLog on the same
+    // path conflicts even inside one process.
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("a.log");
+    let cp = dir.path().join("a.cp");
+    let key = generate();
+    let first = AuditLog::create(&log, &cp, "test-engine", key.clone()).unwrap();
+    let err = AuditLog::open(&log, &cp, "test-engine", key.clone()).unwrap_err();
+    assert!(matches!(err, AuditError::Locked), "got {err}");
+    drop(first);
+    assert!(AuditLog::open(&log, &cp, "test-engine", key).is_ok());
+}
